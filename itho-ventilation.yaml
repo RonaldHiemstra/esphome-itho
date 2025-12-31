@@ -1,0 +1,588 @@
+esphome:
+  name: itho-ventilation
+  friendly_name: ITHO ventilation
+  on_boot:
+    then:
+      - lambda: |-
+          get_mac_address_raw(id(my_device_id));
+          ESP_LOGI("itho", "Device MAC: %s", format_hex_pretty(id(my_device_id), 6).c_str());
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+spi:
+  clk_pin: GPIO18 # CC1101 SCK
+  miso_pin: GPIO19 # CC1101 MISO/GDO1
+  mosi_pin: GPIO23 # CC1101 MOSI
+
+# Enable logging
+logger:
+
+mqtt:
+  broker: !secret mqtt_broker
+  username: !secret mqtt_username
+  password: !secret mqtt_password
+  log_topic: esp/logs/itho-ventilation
+
+ota:
+  - platform: esphome
+    password: "f65ab2932751d08bf5775d8058830d88"
+
+web_server:
+   port: 80
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+# Store device ID for RF transmission
+globals:
+  # Device ID bytes (MAC address of device. Use last 3 bytes which are probably unique)
+  - id: my_device_id
+    type: uint8_t[6]
+    restore_value: no
+    initial_value: '{0,0,0,0,0,0}'
+  - id: device_type
+    type: uint8_t
+    restore_value: no
+    initial_value: '22'  # 0x16 = 22 decimal, standard ITHO remote type
+  - id: packet_counter
+    type: uint8_t
+    restore_value: yes
+    initial_value: '0'
+
+# https://esphome.io/components/cc1101/
+# Configuration based on IthoCC1101::initReceiveMessage()
+# See: https://github.com/letscontrolit/ESPEasy/blob/15830d38268eb28c3fe234413a81f6cf015aeda9/lib/Itho/IthoCC1101.cpp#L238
+cc1101:
+  cs_pin: GPIO22
+  # Base/carrier frequency: 868.299866MHz
+  frequency: 868.2999MHz
+  # 2-FSK modulation
+  modulation_type: 2-FSK
+  # Symbol rate: MDMCFG4=0x5A, MDMCFG3=0x83 = 38.3835 kBaud
+  symbol_rate: 38383
+  # Filter bandwidth: ~203kHz (based on MDMCFG4=0x5A)
+  filter_bandwidth: 203kHz
+  # Frequency deviation: DEVIATN=0x50 = 50.78125kHz
+  fsk_deviation: 50kHz
+  # Output power
+  output_power: 10
+  # Enable packet mode
+  gdo0_pin: GPIO16
+  packet_mode: true
+  # Packet mode configuration
+  num_preamble: 3  # 6 bytes automatic + 1 manual = 7 bytes (exact ITHO spec)
+  sync_mode: 16/16  # MDMCFG2=0x02 = 16-bit sync word
+  sync1: 0xB3      # SYNC1=179 (0xB3)
+  sync0: 0x2A      # SYNC0=42 (0x2A)
+  packet_length: 63  # Fixed packet length (sync bytes removed by CC1101)
+  crc_enable: false  # CRC disabled in ITHO
+  whitening: false   # Data whitening disabled
+  on_packet:
+    then:
+      - lambda: |-
+          // ITHO packet decoder based on IthoCC1101::messageDecode()
+          // Decode Manchester-like encoding with 1-0 pattern every 8 bits
+          // STARTBYTE=2: Skip first 2 bytes after sync word
+
+          if (x.size() != 63) {
+            ESP_LOGW("itho", "Invalid packet length: %d", x.size());
+            return;
+          }
+
+          // Decoded data buffer
+          uint8_t decoded[32] = {0};
+          uint8_t decoded_len = 0;
+
+          // Decoding parameters - start from byte 2 (STARTBYTE)
+          const int STARTBYTE = 2;
+          uint8_t out_i = 0;         // byte index
+          uint8_t out_j = 4;         // bit index (start at bit 4)
+          uint8_t in_bitcounter = 0; // process per 10 input bits
+
+          // Decode the packet starting from STARTBYTE
+          for (int i = STARTBYTE; i < x.size(); i++) {
+            for (int j = 7; j >= 0; j--) {
+              // Select even bits (0, 2, 4, 6) for output
+              if (in_bitcounter == 0 || in_bitcounter == 2 ||
+                  in_bitcounter == 4 || in_bitcounter == 6) {
+                uint8_t bit = (x[i] >> j) & 0x01;
+                decoded[out_i] |= (bit << out_j);
+                out_j++;
+                if (out_j > 7) { out_j = 0; }
+                if (out_j == 4) {
+                  out_i++;
+                  if (out_i >= 32) break;
+                }
+              }
+
+              in_bitcounter++;
+              if (in_bitcounter > 9) { in_bitcounter = 0; }
+            }
+            if (out_i >= 32) break;
+          }
+          decoded_len = out_i;
+
+          // Log decoded packet
+          std::string decoded_hex = format_hex_pretty(decoded, decoded_len);
+          ESP_LOGD("itho", "rssi: %.1f dBm, lqi: %u, Decoded (%d bytes): %s", rssi, lqi, decoded_len, decoded_hex.c_str());
+
+          // Check for valid ITHO packet (min 12 bytes)
+          if (decoded_len < 12) {
+            ESP_LOGW("itho", "Decoded packet too short");
+            return;
+          }
+
+          const char* command = nullptr;
+          const char* controller_source = nullptr;
+
+          // Check if this is a status message from the unit (starts with 0x1A)
+          // Format: 1A.94.D8.F9.94.D8.F9.XX.31.D9.11.00.06.YY...
+          if (decoded[0] == 0x1A && decoded[12] == 0x06) {
+            // ===== ALLOWED REMOTE IDs LIST =====
+            // Add your Itho remote IDs here with their room names
+            struct {
+              uint8_t id[3];
+              const char* room_name;
+            } allowed_remotes[] = {
+              // UPDATE THESE WITH YOUR ACTUAL REMOTE IDs!
+              {{0x94, 0xD8, 0xF9}, "Ventilatie unit"},
+            };
+
+            // Check if device ID is in allowed list
+            for (const auto& remote : allowed_remotes) {
+              if (memcmp(&decoded[1], remote.id, 3) == 0) {
+                controller_source = remote.room_name;
+                break;
+              }
+            }
+
+            if (controller_source == nullptr) {
+              ESP_LOGW("itho", "Ignored packet from unknown control unit: %s", format_hex_pretty(&decoded[1], 3).c_str());
+              return;  // Reject commands from unknown devices
+            }
+
+            controller_source = "Ventilatie unit";
+            // Byte 13 contains speed indicator
+            // Percentage calculation: 0x20 (32) = 0%, 0x80 (128)+ = 100%
+            uint8_t speed_byte = decoded[13];
+
+            // Calculate percentage (0x20-0x80 mapped to 0-100%)
+            float percentage = 0.0;
+            if (speed_byte >= 0x80) {
+              percentage = 100.0;
+            } else if (speed_byte >= 0x20) {
+              percentage = ((float)(speed_byte - 0x20) / (0x80 - 0x20)) * 100.0;
+            }
+            id(fan_speed).publish_state(percentage);
+
+            // Categorize speed for text sensors
+            // Ignore transient values during speed changes
+            if (speed_byte >= 0x20) {
+              if (speed_byte >= 0x80) {
+                // >= 128: High
+                command = "High";
+              } else if (speed_byte >= 0x38) {
+                // 56-127: Medium (position 2 auto or ramped up)
+                command = "Medium";
+              } else if (speed_byte >= 0x30) {
+                // 48-55: Low (position 1)
+                command = "Low";
+              }
+            }
+
+            if (command != "Unknown") {
+              id(last_command).publish_state(command);
+            }
+          }
+          // Remote command packets: check bytes 5-10 against command patterns
+          // Based on IthoCC1101::checkIthoCommand() and command byte arrays
+          // Low:    22 F1 03 00 02 04 (0x22, 0xF1, 0x03, 0x00, 0x02, 0x04)
+          // Medium: 22 F1 03 00 03 04 (0x22, 0xF1, 0x03, 0x00, 0x03, 0x04)
+          // High:   22 F1 03 00 04 04 (0x22, 0xF1, 0x03, 0x00, 0x04, 0x04)
+          // Timer:  22 F3 03 00 00 0A (0x22, 0xF3, 0x03, 0x00, 0x00, 0x0A/14/1E)
+          else if (decoded_len >= 11 && decoded[5] == 0x22 && decoded[7] == 0x03) {
+            // ===== ALLOWED REMOTE IDs LIST =====
+            // Add your Itho remote IDs here with their room names
+            struct {
+              uint8_t id[3];
+              const char* room_name;
+            } allowed_remotes[] = {
+              // UPDATE THESE WITH YOUR ACTUAL REMOTE IDs!
+              {{0x51, 0x36, 0x35}, "Badkamer"},
+            };
+
+            // Check if device ID is in allowed list
+            for (const auto& remote : allowed_remotes) {
+              if (memcmp(&decoded[1], remote.id, 3) == 0) {
+                controller_source = remote.room_name;
+                break;
+              }
+            }
+
+            if (controller_source == nullptr) {
+              ESP_LOGW("itho", "Ignored packet from unknown remote unit: %s", format_hex_pretty(&decoded[1], 3).c_str());
+              return;  // Reject commands from unknown devices
+            }
+
+            // Timer: byte[6]==0xF3, byte[9]==0x00, byte[10]==0x0A/0x14/0x1E
+            if (decoded[6] == 0xF3 && decoded[9] == 0x00) {
+              command = "Timer";
+            }
+            // Low/Medium/High: byte[6]==0xF1, byte[10]==0x04
+            else if (decoded[6] == 0xF1 && decoded[10] == 0x04) {
+              // Distinguish by byte[9]
+              if (decoded[9] == 0x02) {
+                command = "Low";
+              } else if (decoded[9] == 0x03) {
+                command = "Medium";
+              } else if (decoded[9] == 0x04) {
+                command = "High";
+              }
+            }
+          }
+
+          // Update sensors for remote commands
+          if (command != nullptr) {
+            ESP_LOGI("itho", "Command: %s (Source: %s)", command, controller_source);
+            id(controller_name).publish_state(controller_source);
+            id(last_command).publish_state(command);
+          }
+
+# Sensors for ITHO status
+sensor:
+  - platform: template
+    name: "Ventilation Speed"
+    id: fan_speed
+    unit_of_measurement: "%"
+    icon: "mdi:fan"
+    accuracy_decimals: 0
+
+  - platform: uptime
+    type: seconds
+    name: Uptime Sensor
+
+  - platform: wifi_signal
+    name: "WiFi Signal Sensor"
+
+# Text sensors for ITHO commands
+text_sensor:
+  - platform: template
+    name: "Last Command"
+    id: last_command
+    icon: "mdi:fan-clock"
+
+  - platform: template
+    name: "Last Control Source"
+    id: controller_name
+    icon: "mdi:remote"
+
+# Buttons for pairing and control
+button:
+  - platform: template
+    name: "Pair Remote"
+    icon: "mdi:link-plus"
+    on_press:
+      - lambda: |-
+          id(packet_counter)++;
+          ESP_LOGI("itho", "Sending join command sequence (counter=%d)...", id(packet_counter));
+      - script.execute: send_join_command
+      - delay: 40ms
+      - lambda: |-
+          ESP_LOGI("itho", "Sending join command #2...");
+      - script.execute: send_join_command
+      - delay: 40ms
+      - lambda: |-
+          ESP_LOGI("itho", "Sending join command #3 - Join sequence complete");
+      - script.execute: send_join_command
+
+  - platform: template
+    name: "Low"
+    icon: "mdi:fan-speed-1"
+    on_press:
+      - lambda: |-
+          id(packet_counter)++;
+          ESP_LOGI("itho", "Sending Low command (counter=%d, device ID: %s)", id(packet_counter), format_hex_pretty(&(id(my_device_id)[3]), 3).c_str());
+      - script.execute:
+          id: send_command
+          command_byte: 0x02
+          command_name: "Low"
+
+  - platform: template
+    name: "Medium"
+    icon: "mdi:fan-speed-2"
+    on_press:
+      - lambda: |-
+          id(packet_counter)++;
+          ESP_LOGI("itho", "Sending Medium command (counter=%d, device ID: %s)", id(packet_counter), format_hex_pretty(&(id(my_device_id)[3]), 3).c_str());
+      - script.execute:
+          id: send_command
+          command_byte: 0x03
+          command_name: "Medium"
+
+  - platform: template
+    name: "High"
+    icon: "mdi:fan-speed-3"
+    on_press:
+      - lambda: |-
+          id(packet_counter)++;
+          ESP_LOGI("itho", "Sending High command (counter=%d, device ID: %s)", id(packet_counter), format_hex_pretty(&(id(my_device_id)[3]), 3).c_str());
+      - script.execute:
+          id: send_command
+          command_byte: 0x04
+          command_name: "High"
+
+# Scripts
+script:
+  # Script to send a command (Low/Medium/High)
+  - id: send_command
+    mode: single
+    parameters:
+      command_byte: uint8_t
+      command_name: string
+    then:
+      - cc1101.send_packet:
+          data: !lambda |-
+            // Build command payload (ESPEasy createMessageCommand)
+            uint8_t payload[24] = {0};
+            payload[0] = id(device_type);                  // 0x16
+            payload[1] = id(my_device_id)[3];
+            payload[2] = id(my_device_id)[4];
+            payload[3] = id(my_device_id)[5];
+            payload[4] = id(packet_counter);
+            payload[5] = 0x22;  // Command type
+            payload[6] = 0xF1;  // Command group
+            payload[7] = 0x03;  // Command source (remote)
+            payload[8] = 0x00;  // Reserved
+            payload[9] = command_byte;  // Command: 0x02=Low, 0x03=Medium, 0x04=High
+            payload[10] = 0x04; // Command ID
+            payload[11] = id(my_device_id)[3];
+            payload[12] = id(my_device_id)[4];
+            payload[13] = id(my_device_id)[5];
+            payload[14] = 0x01;
+            payload[15] = 0x10;
+            payload[16] = 0xE0;
+            payload[17] = id(my_device_id)[3];
+            payload[18] = id(my_device_id)[4];
+            payload[19] = id(my_device_id)[5];
+            // Calculate checksum
+            uint8_t sum = 0;
+            for (int i = 0; i < 20; i++) sum += payload[i];
+            payload[20] = (uint8_t)(0x100 - (sum & 0xFF));
+
+            // Encode with full Manchester encoding (ESPEasy messageEncode)
+            std::vector<uint8_t> encoded;
+            encoded.push_back(0xAA);
+            encoded.push_back(0xAB);
+            encoded.push_back(0xFE);
+            encoded.push_back(0x00);
+            encoded.push_back(0xB3);
+            encoded.push_back(0x2A);
+            encoded.push_back(0xAB);
+            encoded.push_back(0x2A);
+
+            uint8_t out_bytecounter = 8;
+            uint8_t out_bitcounter = 0;
+            uint8_t out_patterncounter = 0;
+            uint8_t bitSelect = 4;
+            uint8_t out_shift = 7;
+
+            for (int i = out_bytecounter; i < 100; i++) encoded.push_back(0x00);
+
+            for (uint8_t dataByte = 0; dataByte < 21; dataByte++) {
+              for (uint8_t dataBit = 0; dataBit < 8; dataBit++) {
+                if (out_bitcounter == 8) {
+                  out_bytecounter++;
+                  out_bitcounter = 0;
+                }
+
+                if (out_patterncounter == 8) {
+                  out_patterncounter = 0;
+                  encoded[out_bytecounter] |= (1 << out_shift);
+                  out_shift--;
+                  out_bitcounter++;
+                  encoded[out_bytecounter] |= (0 << out_shift);
+                  if (out_shift == 0) out_shift = 8;
+                  out_shift--;
+                  out_bitcounter++;
+                }
+
+                if (out_bitcounter == 8) {
+                  out_bytecounter++;
+                  out_bitcounter = 0;
+                }
+
+                uint8_t bit = (payload[dataByte] & (1 << bitSelect)) >> bitSelect;
+                bitSelect++;
+                if (bitSelect == 8) bitSelect = 0;
+
+                encoded[out_bytecounter] |= (bit << out_shift);
+                out_shift--;
+                out_bitcounter++;
+                out_patterncounter++;
+
+                bit = ~bit & 0x01;
+                encoded[out_bytecounter] |= (bit << out_shift);
+                if (out_shift == 0) out_shift = 8;
+                out_shift--;
+                out_bitcounter++;
+                out_patterncounter++;
+              }
+            }
+
+            if (out_bitcounter < 8) {
+              for (int i = out_bitcounter; i < 8; i += 2) {
+                encoded[out_bytecounter] |= (1 << out_shift);
+                out_shift--;
+                encoded[out_bytecounter] |= (0 << out_shift);
+                if (out_shift == 0) out_shift = 8;
+                out_shift--;
+              }
+            }
+
+            encoded.resize(out_bytecounter + 1);
+            encoded.push_back(0xCA);
+            for (int i = 0; i < 7; i++) encoded.push_back(0xAA);
+            return encoded;
+
+  # Script to send a join command (used for pairing - sends 3 times)
+  - id: send_join_command
+    mode: single
+    then:
+      - cc1101.send_packet:
+          data: !lambda |-
+            // Build decoded payload according to createMessageJoin() from ESPEasy
+            uint8_t payload[24] = {0};
+
+            // Bytes 0-3: deviceType + deviceId
+            payload[0] = id(device_type);                  // 0x16 = 22
+            payload[1] = id(my_device_id)[3];
+            payload[2] = id(my_device_id)[4];
+            payload[3] = id(my_device_id)[5];
+
+            // Byte 4: counter
+            payload[4] = id(packet_counter);
+
+            // Bytes 5-10: Join command bytes (ithoMessageJoinCommandBytes)
+            payload[5] = 0x1F;  // 31
+            payload[6] = 0xC9;  // 201
+            payload[7] = 0x0C;  // 12
+            payload[8] = 0x00;  // 0
+            payload[9] = 0x22;  // 34
+            payload[10] = 0xF1; // 241
+
+            // Bytes 11-13: deviceId again
+            payload[11] = id(my_device_id)[3];
+            payload[12] = id(my_device_id)[4];
+            payload[13] = id(my_device_id)[5];
+
+            // Bytes 14-16: Fixed values
+            payload[14] = 0x01;  // 1
+            payload[15] = 0x10;  // 16
+            payload[16] = 0xE0;  // 224
+
+            // Bytes 17-19: deviceId again
+            payload[17] = id(my_device_id)[3];
+            payload[18] = id(my_device_id)[4];
+            payload[19] = id(my_device_id)[5];
+
+            // Byte 20: Counter2 (CRC) - sum of bytes 0-19 subtracted from 0
+            uint8_t sum = 0;
+            for (int i = 0; i < 20; i++) sum += payload[i];
+            payload[20] = (uint8_t)(0x100 - (sum & 0xFF));
+
+            // Encode message with Manchester-like encoding
+            // Start with message header (1x 0xAA + 0xAB 0xFE 0x00 0xB3 0x2A 0xAB 0x2A)
+            // Note: CC1101 will automatically add 6 bytes of 0xAA preamble (num_preamble: 3)
+            // We add 1 manual byte for exactly 7 bytes total (ITHO spec)
+            std::vector<uint8_t> encoded;
+            encoded.push_back(0xAA);  // 1 manual preamble byte
+            encoded.push_back(0xAB);  // Start delimiter
+            encoded.push_back(0xFE);
+            encoded.push_back(0x00);
+            encoded.push_back(0xB3);  // Sync byte 1
+            encoded.push_back(0x2A);  // Sync byte 2
+            encoded.push_back(0xAB);
+            encoded.push_back(0x2A);
+            // Total: 8 bytes header (encoded buffer starts at index 8)
+
+            // Manchester-like encoding of payload
+            // Pattern: for each data bit, insert 1-0 pattern every 8 bits
+            uint8_t out_bytecounter = 8;
+            uint8_t out_bitcounter = 0;
+            uint8_t out_patterncounter = 0;
+            uint8_t bitSelect = 4;  // Start with bits 4-7, then 0-3
+            uint8_t out_shift = 7;
+
+            // Zero the output buffer
+            for (int i = out_bytecounter; i < 100; i++) encoded.push_back(0x00);
+
+            for (uint8_t dataByte = 0; dataByte < 21; dataByte++) {
+              for (uint8_t dataBit = 0; dataBit < 8; dataBit++) {
+                if (out_bitcounter == 8) {
+                  out_bytecounter++;
+                  out_bitcounter = 0;
+                }
+
+                // Insert 1-0 pattern every 8 bits
+                if (out_patterncounter == 8) {
+                  out_patterncounter = 0;
+                  encoded[out_bytecounter] |= (1 << out_shift);
+                  out_shift--;
+                  out_bitcounter++;
+                  encoded[out_bytecounter] |= (0 << out_shift);
+                  if (out_shift == 0) out_shift = 8;
+                  out_shift--;
+                  out_bitcounter++;
+                }
+
+                if (out_bitcounter == 8) {
+                  out_bytecounter++;
+                  out_bitcounter = 0;
+                }
+
+                // Extract bit from payload
+                uint8_t bit = (payload[dataByte] & (1 << bitSelect)) >> bitSelect;
+                bitSelect++;
+                if (bitSelect == 8) bitSelect = 0;
+
+                // Write even bit
+                encoded[out_bytecounter] |= (bit << out_shift);
+                out_shift--;
+                out_bitcounter++;
+                out_patterncounter++;
+
+                // Write odd bit (inverse)
+                bit = ~bit & 0x01;
+                encoded[out_bytecounter] |= (bit << out_shift);
+                if (out_shift == 0) out_shift = 8;
+                out_shift--;
+                out_bitcounter++;
+                out_patterncounter++;
+              }
+            }
+
+            // Fill last byte with 1-0 pattern if needed
+            if (out_bitcounter < 8) {
+              for (int i = out_bitcounter; i < 8; i += 2) {
+                encoded[out_bytecounter] |= (1 << out_shift);
+                out_shift--;
+                encoded[out_bytecounter] |= (0 << out_shift);
+                if (out_shift == 0) out_shift = 8;
+                out_shift--;
+              }
+            }
+
+            // Resize to actual length + 1
+            encoded.resize(out_bytecounter + 1);
+
+            // Add end byte (0xCA = 202)
+            encoded.push_back(0xCA);
+
+            // Add 7 bytes of 0xAA padding
+            for (int i = 0; i < 7; i++) encoded.push_back(0xAA);
+
+            return encoded;
