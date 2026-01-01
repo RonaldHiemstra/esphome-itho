@@ -28,6 +28,7 @@ The ITHO ventilation system uses the following RF parameters (derived from IthoC
 ## Features
 
 - **Receive RF commands** from ITHO remote controls (Low, Medium, High, Timer)
+- **Timer countdown display** - Shows remaining time when timer mode is activated (10/20/30 minutes)
 - **Remote ID whitelist** - Only accept commands from authorized remotes (security feature)
 - **Transmit commands** to control ventilation speed (Low, Medium, High)
 - **Pairing support** to register ESP32 as a remote control - **TODO: Not yet working, debugging needed!**
@@ -85,6 +86,18 @@ These buttons are available in:
 - Home Assistant (as button entities)
 - The ESP32 web interface (http://\[device-ip\])
 - MQTT (publish to button topics)
+
+### Timer Mode
+
+When a Timer command is received from an ITHO remote control, the system:
+
+1. Detects the timer duration (10, 20, or 30 minutes based on the command)
+2. Starts a countdown timer displayed in the "Timer" text sensor
+3. Shows remaining time in MM:SS format (e.g., "10:00", "5:30")
+4. Automatically stops and displays "Off" when the timer expires
+5. Timer is cancelled if a manual Low/Medium/High command is received
+
+**Note:** Timer mode can only be activated by original ITHO remote controls that support timer functionality. The ESP32 currently only transmits Low/Medium/High commands.
 
 ## Remote ID Whitelist (Security)
 
@@ -215,6 +228,7 @@ The complete configuration is in [itho-ventilation.yaml](itho-ventilation.yaml) 
   - `fan_speed` - Current fan speed percentage (0-100%)
   - `last_command` - Last received command (Low/Medium/High/Timer)
   - `controller_name` - Source of last command (e.g., "Badkamer" or "Ventilatie unit")
+  - `timer` - Timer countdown display (MM:SS format, or "Off" when inactive)
 - MQTT topics under `esp/` prefix
 - State changes published immediately
 
@@ -275,12 +289,11 @@ package "ITHO Ventilation Control" {
 
 ## Future Enhancements
 
-- **Timer button** - Add timed boost functionality (10/20/30 minute modes)
+- **Timer button** - Add ability to transmit timer commands from ESP32 (currently only receives/displays timer from ITHO remotes)
 - **Additional sensors** - Monitor air quality, humidity, and temperature  
 - **Advanced automation** - Schedule ventilation based on time or sensor data
 - **Energy monitoring** - Track power consumption
 - **Enclosure design** - 3D-printed case for clean installation
-- **Packet counter** - Increment counter byte in transmissions to prevent replay attacks
 
 ## Known Limitations
 

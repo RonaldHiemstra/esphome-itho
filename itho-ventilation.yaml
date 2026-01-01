@@ -52,6 +52,10 @@ globals:
     type: uint8_t
     restore_value: yes
     initial_value: '0'
+  - id: timeout
+    type: int32_t
+    restore_value: no
+    initial_value: '0'
 
 # https://esphome.io/components/cc1101/
 # Configuration based on IthoCC1101::initReceiveMessage()
@@ -228,12 +232,17 @@ cc1101:
               return;  // Reject commands from unknown devices
             }
 
-            // Timer: byte[6]==0xF3, byte[9]==0x00, byte[10]==0x0A/0x14/0x1E
+            // Timer: byte[6]==0xF3, byte[9]==0x00, byte[10]==0x0A/0x14/0x1E (10, 20 or 30 minutes)
             if (decoded[6] == 0xF3 && decoded[9] == 0x00) {
               command = "Timer";
+              id(timeout) = decoded[10] * 60;
+              if (! id(timer_tick).is_running()) {
+                id(timer_tick).execute();  // Start the timer
+              }
             }
             // Low/Medium/High: byte[6]==0xF1, byte[10]==0x04
             else if (decoded[6] == 0xF1 && decoded[10] == 0x04) {
+              id(timeout) = 0;  // Disable the timer
               // Distinguish by byte[9]
               if (decoded[9] == 0x02) {
                 command = "Low";
@@ -279,6 +288,11 @@ text_sensor:
     name: "Last Control Source"
     id: controller_name
     icon: "mdi:remote"
+
+  - platform: template
+    name: "Timer"
+    id: timer
+    icon: "mdi:timer"
 
 # Buttons for pairing and control
 button:
@@ -586,3 +600,33 @@ script:
             for (int i = 0; i < 7; i++) encoded.push_back(0xAA);
 
             return encoded;
+
+  # inspired by https://karlquinsland.com/esphome-dynamic-timer/
+  - id: timer_tick
+    # Start a new run after previous runs completes. This will happen until timer.stop() is called on us
+    ##
+    mode: queued
+    then:
+      # A single 'tick' is 1 second long
+      - delay: 1s
+      - lambda: |-
+          // First, update the number of ticks
+          id(timeout) -= 1;
+
+          // Then check if we have timed out
+          if (id(timeout) <= 0) {
+            ESP_LOGD("itho", "timer finished");
+            id(timer).publish_state("Off");
+            // And finally, stop the ticking timer
+            id(timer_tick).stop();
+            ESP_LOGD("itho", "timer_tick now stopped!");
+          }
+          else {
+            int minutes = id(timeout) / 60;
+            int seconds = id(timeout) % 60;
+            char buffer[20];
+            sprintf(buffer, "%d:%02d", minutes, seconds);
+            id(timer).publish_state(buffer);
+            // make sure we run again..
+            id(timer_tick).execute();
+          }
