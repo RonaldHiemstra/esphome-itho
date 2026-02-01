@@ -18,9 +18,10 @@ The ITHO ventilation system uses the following RF parameters (derived from IthoC
 | Symbol rate         | 38.383 kBaud    | MDMCFG4=0x5A, MDMCFG3=0x83             |
 | Filter bandwidth    | ~203 kHz        | MDMCFG4=0x5A                           |
 | Frequency deviation | 50 kHz          | DEVIATN=0x50                           |
-| Sync word           | 0xB3 0x2A       | 16-bit sync (179, 42 decimal)          |
-| Packet length       | 63 bytes        | Fixed length after sync word           |
-| Preamble            | 7 bytes (0xAA)  | 6 auto (num_preamble: 3) + 1 manual    |
+| Sync word           | 0xAB 0xFE       | 16-bit sync (171, 254 decimal)         |
+| Packet length       | 63 bytes        | Fixed length; CC1101 strips sync word  |
+| Preamble            | 8 bytes (0xAA)  | Auto-generated (num_preamble: 4)       |
+| ITHO header         | 5 bytes         | 0x00 0xB3 0x2A 0xAB 0x2A (after sync)  |
 | CRC                 | Disabled        | No hardware CRC                        |
 | Whitening           | Disabled        | Raw data                               |
 | Encoding            | Manchester-like | Even bits extracted from 10-bit groups |
@@ -146,7 +147,7 @@ This prevents unauthorized RF devices from controlling your ventilation system.
 
 ### Remote Command Packets
 
-Remote control commands are 63 bytes (raw) which decode to 24 bytes. The Manchester-like decoder starts from STARTBYTE=2 and extracts even bits (0, 2, 4, 6) from each 10-bit group.
+Remote control commands are 63 bytes (raw) which decode to approximately 24 bytes. The Manchester-like decoder starts from STARTBYTE=5 (after the 5-byte ITHO header) and extracts even bits (0, 2, 4, 6) from each 10-bit group.
 
 **Command byte patterns at decoded bytes 5-10:**
 
@@ -195,7 +196,7 @@ The hardwired wall switch has three positions:
 The complete configuration is in [itho-ventilation.yaml](itho-ventilation.yaml) and includes:
 
 1. **CC1101 Component** - Configures RF transceiver with ITHO-specific parameters
-2. **Packet Decoder Lambda** - Implements Manchester-like decoding starting from STARTBYTE=2
+2. **Packet Decoder Lambda** - Implements Manchester-like decoding starting from STARTBYTE=5 (after 5-byte ITHO header)
 3. **Command Detection** - Pattern matching for remote commands and status messages
 4. **MQTT Integration** - Publishes state to Home Assistant via MQTT
 5. **Text Sensors** - Exposes current command and last command states
@@ -204,20 +205,21 @@ The complete configuration is in [itho-ventilation.yaml](itho-ventilation.yaml) 
 
 **Manchester Decoder:**
 
-- Processes 63-byte raw packets starting from byte 2 (STARTBYTE)
+- Processes 63-byte raw packets starting from byte 5 (STARTBYTE, after 5-byte ITHO header)
 - Extracts even bits (0, 2, 4, 6) from each 10-bit group
-- Produces 24-byte decoded packets
+- Produces approximately 24-byte decoded packets (up to 32 bytes buffer)
 
 **Important:** The ITHO protocol uses a **custom Manchester-like encoding** that is incompatible with the CC1101's built-in `manchester` setting. Do not enable `manchester: true` in the cc1101 configuration - this will cause incorrect decoding. The ITHO encoding scheme inserts data bits at specific positions (0, 2, 4, 6) within 10-bit groups, which is different from standard Manchester encoding's simple bit transitions. Our custom decoder implementation is required for correct operation.
 
-**Preamble Handling:** The CC1101 automatically adds 6 bytes via the `num_preamble: 3` setting, and we manually add 1 byte in the encoding for exactly 7 bytes total (exact ITHO specification compliance). This ensures maximum compatibility with the original ITHO protocol. Once transmission is confirmed working, we could simplify to `num_preamble: 4` (8 bytes automatic, no manual byte) since receivers typically tolerate one extra preamble byte.
+**Preamble Handling:** The CC1101 automatically adds 8 bytes via the `num_preamble: 4` setting. While the original ITHO specification calls for 7 bytes, receivers typically tolerate one extra preamble byte without issues.
 
 **Command Detection Logic:**
 
 ```text
-1. Check if status packet (byte[0]==0x1A && byte[12]==0x06)
+1. Validate minimum decoded packet length (≥14 bytes)
+2. Check if status packet (byte[0]==0x1A && byte[12]==0x06)
    → Parse speed from byte[13]
-2. Check if remote command (byte[5]==0x22 && byte[7]==0x03)
+3. Check if remote command (byte[5]==0x22 && byte[7]==0x03)
    → Timer: byte[6]==0xF3
    → Low/Med/High: byte[6]==0xF1, distinguished by byte[9]
 ```
