@@ -1,5 +1,9 @@
+substitutions:
+  device_name: itho-ventilation  # Used for hostname (must use hyphens, no underscores)
+  device_prefix: "ITHO"          # Unique prefix, used for entity names (home assistant IDs) (underscores allowed)
+
 esphome:
-  name: itho-ventilation
+  name: ${device_name}
   friendly_name: ITHO ventilation
   on_boot:
     then:
@@ -19,12 +23,13 @@ spi:
 
 # Enable logging
 logger:
+  level: DEBUG
 
 mqtt:
   broker: !secret mqtt_broker
   username: !secret mqtt_username
   password: !secret mqtt_password
-  log_topic: esp/logs/itho-ventilation
+  log_topic: esp/logs/${device_name}
 
 ota:
   - platform: esphome
@@ -37,8 +42,42 @@ wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
 
-# Store device ID for RF transmission
+# =============================================================================
+# ALLOWED DEVICE IDs CONFIGURATION
+# =============================================================================
+# Configure which ITHO devices are allowed to control this ESP32.
+# To find device IDs, monitor logs when a device sends a command.
+# The ESP will show "Ignored packet from unknown [type]: XX.YY.ZZ"
+
+# Format: "XX.YY.ZZ Device Name" - one entry per line
+# Each device ID is 3 bytes in hexadecimal format (XX.YY.ZZ)
+# followed by a space and then the device name/description
+
 globals:
+  # ALLOWED REMOTE IDs (Physical remotes and virtual remotes like Home Assistant)
+  - id: allowed_remotes_config
+    type: std::vector<std::string>
+    restore_value: no
+    initial_value: '{"51.36.35 Badkamer", "5F.53.40 Home assistant", "A8.86.D4 ESP test remote"}'
+
+  # ALLOWED VENTILATION UNIT IDs
+  - id: allowed_units_config
+    type: std::vector<std::string>
+    restore_value: no
+    initial_value: '{"94.D8.F9 Ventilatie unit"}'
+
+# =============================================================================
+# DEVICE-SPECIFIC CONFIGURATION ENDS HERE
+# =============================================================================
+# Everything above this line is device-specific and should be customized for
+# each device (device name, prefix, WiFi, MQTT, GPIO pins, etc.).
+#
+# Everything below this line is SHARED configuration that can be copied as-is
+# to other devices. Only the 'device_prefix' substitution at the top needs to
+# be changed to ensure unique IDs in Home Assistant.
+# =============================================================================
+
+# Store device ID for RF transmission
   # Device ID bytes (MAC address of device. Use last 3 bytes which are probably unique)
   - id: my_device_id
     type: uint8_t[6]
@@ -106,14 +145,14 @@ cc1101:
 
           for (int i = 0; i < sizeof(id(itho_header)); ++i) {
             if (x[i] != id(itho_header)[i]) {
-              if (rssi > -100) {  // Silently ignore non ITHO packets with a rssi below 100 dBm
-                ESP_LOGD("itho", "non itho message: %s", format_hex_pretty(x, x.size()).c_str());
+              if (rssi > -90) {  // Silently ignore non ITHO packets with a low rssi
+                ESP_LOGD("itho", "rssi: %.1f dBm, Non itho data: %s", rssi, format_hex_pretty(x).c_str());
               }
               return;
             }
           }
 
-          // ESP_LOGD("itho", "raw message: %s", format_hex_pretty(x, x.size()).c_str());
+          ESP_LOGD("itho", "rssi: %.1f dBm, lqi: %u, data: %s", rssi, lqi, format_hex_pretty(x).c_str());
 
           // Decoded data buffer
           uint8_t decoded[32] = {0};
@@ -149,7 +188,7 @@ cc1101:
           decoded_len = out_i;
 
           // Log decoded packet
-          ESP_LOGD("itho", "rssi: %.1f dBm, lqi: %u, Decoded (%d bytes): %s", rssi, lqi, decoded_len, format_hex_pretty(decoded, decoded_len).c_str());
+          ESP_LOGD("itho", "Received message: %s", format_hex_pretty(decoded, decoded_len).c_str());
 
           // Check for valid ITHO packet (min 14 bytes)
           if (decoded_len < 14) {
@@ -157,98 +196,75 @@ cc1101:
             return;
           }
 
-          const char* command = nullptr;
-          const char* device_name = nullptr;
-
           // Check if this is a status message from the unit (starts with 0x1A)
           // Format: 1A.94.D8.F9.94.D8.F9.XX.31.D9.11.00.06.YY...
           if (decoded[0] == 0x1A && decoded[12] == 0x06) {
-            // ===== ALLOWED VENTILATION UNIT IDs LIST =====
-            // Add your Itho ventilation unit IDs here with their names
-            struct {
-              uint8_t id[3];
-              const char* name;
-            } allowed_devices[] = {
-              // UPDATE THESE WITH YOUR ACTUAL VENTILATION-UNIT IDs!
-              {{0x94, 0xD8, 0xF9}, "Ventilatie unit"},
-            };
-
-            // Check if device ID is in allowed list
-            for (const auto& device : allowed_devices) {
-              if (memcmp(&decoded[1], device.id, 3) == 0) {
-                device_name = device.name;
+            // Parse allowed unit IDs from config vector (format: "XX.YY.ZZ Name")
+            std::string source_name = "";
+            std::string device_id = format_hex_pretty(&decoded[1], 3);
+            
+            for (const auto& entry : id(allowed_units_config)) {
+              // Compare device ID (format: "XX.YY.ZZ Name")
+              if (entry.substr(0, 8) == device_id) {
+                source_name = entry.substr(9);  // Extract name (everything after "XX.YY.ZZ ")
                 break;
               }
             }
 
-            if (device_name == nullptr) {
-              ESP_LOGW("itho", "Ignored packet from unknown ventilation unit: %s", format_hex_pretty(&decoded[1], 3).c_str());
+            if (source_name.empty()) {
+              ESP_LOGW("itho", "Ignored packet from unknown ventilation unit: %s", device_id.c_str());
               return;  // Reject commands from unknown devices
             }
 
             // Byte 13 contains speed indicator
-            // Percentage calculation: 0x20 (32) = 0%, 0x80 (128)+ = 100%
+            // Percentage calculation: 0x20 = 0%, 0x80 = 100%
             uint8_t speed_byte = decoded[13];
 
-            // Calculate percentage (0x20-0x80 mapped to 0-100%)
-            float percentage = 0.0;
+            // Calculate percentage (0-200 mapped to 0-100%)
+            float speed = speed_byte / 2.0;
+            ESP_LOGI("itho", "Received fan speed: %.1f (Source: %s)", speed, source_name.c_str());
+            id(fan_speed).publish_state(speed);
+
+            // Clear command if current speed no longer matches the requested command
             if (speed_byte >= 0x80) {
-              percentage = 100.0;
-            } else if (speed_byte >= 0x20) {
-              percentage = ((float)(speed_byte - 0x20) / (0x80 - 0x20)) * 100.0;
-            }
-            id(fan_speed).publish_state(percentage);
-
-            // Categorize speed for text sensors
-            // Ignore transient values during speed changes
-            if (speed_byte >= 0x20) {
-              if (speed_byte >= 0x80) {
-                // >= 128: High
-                command = "High";
-              } else if (speed_byte >= 0x38) {
-                // 56-127: Medium (position 2 auto or ramped up)
-                command = "Medium";
-              } else if (speed_byte >= 0x30) {
-                // 48-55: Low (position 1)
-                command = "Low";
+              if ((id(last_command).state != "High") && (id(last_command).state != "Timer")) {
+                id(last_command).publish_state("");
               }
-            }
-
-            if (command != nullptr) {
-              id(last_command).publish_state(command);
+            } else if (speed_byte >= 0x38) {
+              if (id(last_command).state != "Medium") {
+                id(last_command).publish_state("");
+              }
+            } else if (speed_byte >= 0x30) {
+              if (id(last_command).state != "Low") {
+                id(last_command).publish_state("");
+              }
             }
           }
           // Remote command packets: check bytes 5-10 against command patterns
           // Based on IthoCC1101::checkIthoCommand() and command byte arrays
-          // Low:    22 F1 03 00 02 04 (0x22, 0xF1, 0x03, 0x00, 0x02, 0x04)
-          // Medium: 22 F1 03 00 03 04 (0x22, 0xF1, 0x03, 0x00, 0x03, 0x04)
-          // High:   22 F1 03 00 04 04 (0x22, 0xF1, 0x03, 0x00, 0x04, 0x04)
-          // Timer:  22 F3 03 00 00 0A (0x22, 0xF3, 0x03, 0x00, 0x00, 0x0A/14/1E)
+          // Low:    0x22, 0xF1, 0x03, 0x00, 0x02, 0x04
+          // Medium: 0x22, 0xF1, 0x03, 0x00, 0x03, 0x04
+          // High:   0x22, 0xF1, 0x03, 0x00, 0x04, 0x04
+          // Timer:  0x22, 0xF3, 0x03, 0x00, 0x00, 0x0A/14/1E
           else if (decoded_len >= 11 && decoded[5] == 0x22 && decoded[7] == 0x03) {
-            // ===== ALLOWED REMOTE IDs LIST =====
-            // Add your Itho remote IDs here with their room names
-            struct {
-              uint8_t id[3];
-              const char* name;
-            } allowed_devices[] = {
-              // UPDATE THESE WITH YOUR ACTUAL REMOTE IDs!
-              {{0x51, 0x36, 0x35}, "Badkamer"},
-              {{0xA4, 0xF0, 0x0F}, "ESP remote"},
-            };
-
-            // Check if device ID is in allowed list
-            for (const auto& device : allowed_devices) {
-              if (memcmp(&decoded[1], device.id, 3) == 0) {
-                device_name = device.name;
+            // Parse allowed remote IDs from config vector (format: "XX.YY.ZZ Name")
+            std::string source_name = "";
+            std::string device_id = format_hex_pretty(&decoded[1], 3);
+            
+            for (const auto& entry : id(allowed_remotes_config)) {
+              // Compare device ID (format: "XX.YY.ZZ Name")
+              if (entry.substr(0, 8) == device_id) {
+                source_name = entry.substr(9);  // Extract name (everything after "XX.YY.ZZ ")
                 break;
               }
             }
 
-            if (device_name == nullptr) {
-              ESP_LOGW("itho", "Ignored packet from unknown remote unit: %s", format_hex_pretty(&decoded[1], 3).c_str());
+            if (source_name.empty()) {
+              ESP_LOGW("itho", "Ignored packet from unknown remote unit: %s", device_id.c_str());
               return;  // Reject commands from unknown devices
             }
 
+            const char* command = nullptr;
             // Timer: byte[6]==0xF3, byte[9]==0x00, byte[10]==0x0A/0x14/0x1E (10, 20 or 30 minutes)
             if (decoded[6] == 0xF3 && decoded[9] == 0x00) {
               command = "Timer";
@@ -269,19 +285,19 @@ cc1101:
                 command = "High";
               }
             }
-          }
 
-          // Update sensors for remote commands
-          if (command != nullptr) {
-            ESP_LOGI("itho", "Command: %s (Source: %s)", command, device_name);
-            id(controller_name).publish_state(device_name);
-            id(last_command).publish_state(command);
+            // Update sensors for remote commands
+            if (command != nullptr) {
+              ESP_LOGI("itho", "Command: %s (Source: %s)", command, source_name.c_str());
+              id(controller_name).publish_state(source_name);
+              id(last_command).publish_state(command);
+            }
           }
 
 # Sensors for ITHO status
 sensor:
   - platform: template
-    name: "Ventilation Speed"
+    name: "${device_prefix} Ventilation Speed"
     id: fan_speed
     unit_of_measurement: "%"
     icon: "mdi:fan"
@@ -289,79 +305,64 @@ sensor:
 
   - platform: uptime
     type: seconds
-    name: Uptime Sensor
+    name: "${device_prefix} Uptime"
 
   - platform: wifi_signal
-    name: "WiFi Signal Sensor"
+    name: "${device_prefix} WiFi Signal"
 
 # Text sensors for ITHO commands
 text_sensor:
   - platform: template
-    name: "Last Command"
+    name: "${device_prefix} Last Command"
     id: last_command
     icon: "mdi:fan-clock"
 
   - platform: template
-    name: "Last Control Source"
+    name: "${device_prefix} Last Control Source"
     id: controller_name
     icon: "mdi:remote"
 
   - platform: template
-    name: "Timer"
+    name: "${device_prefix} Timer"
     id: timer
     icon: "mdi:timer"
 
 # Buttons for pairing and control
 button:
   - platform: template
-    name: "Pair Remote"
+    name: "${device_prefix} Pair Remote"
     icon: "mdi:link-plus"
     on_press:
-      - lambda: |-
-          id(packet_counter)++;
-          ESP_LOGI("itho", "Sending Join command (counter=%d)", id(packet_counter));
       - script.execute:
           id: send_join_command
 
   - platform: template
-    name: "Leave Remote"
+    name: "${device_prefix} Leave Remote"
     icon: "mdi:link-off"
     on_press:
-      - lambda: |-
-          id(packet_counter)++;
-          ESP_LOGI("itho", "Sending Leave command (counter=%d)", id(packet_counter));
       - script.execute:
           id: send_leave_command
 
   - platform: template
-    name: "Low"
+    name: "${device_prefix} Low"
     icon: "mdi:fan-speed-1"
     on_press:
-      - lambda: |-
-          id(packet_counter)++;
-          ESP_LOGI("itho", "Sending Low command (counter=%d)", id(packet_counter));
       - script.execute:
           id: send_command
           command_byte: 0x02
 
   - platform: template
-    name: "Medium"
+    name: "${device_prefix} Medium"
     icon: "mdi:fan-speed-2"
     on_press:
-      - lambda: |-
-          id(packet_counter)++;
-          ESP_LOGI("itho", "Sending Medium command (counter=%d)", id(packet_counter));
       - script.execute:
           id: send_command
           command_byte: 0x03
 
   - platform: template
-    name: "High"
+    name: "${device_prefix} High"
     icon: "mdi:fan-speed-3"
     on_press:
-      - lambda: |-
-          id(packet_counter)++;
-          ESP_LOGI("itho", "Sending High command (counter=%d)", id(packet_counter));
       - script.execute:
           id: send_command
           command_byte: 0x04
@@ -371,25 +372,20 @@ script:
   - id: send_packet_data
     mode: queued
     parameters:
-      packet_data: uint8_t*
-      packet_size: uint8_t
-      max_repeat: uint8_t
+      packet_data: std::vector<uint8_t>
+      transmit_count: uint8_t
       retransmit_delay: uint8_t
     then:
       - cc1101.send_packet:
           data: !lambda |-
-            // Return the full packet data
-            ESP_LOGD("rhi", "sending packet_data");
-            return {packet_data, &packet_data[packet_size]};
+            // Return the full packet data (packet_data is copied by value, safe to use)
+            return packet_data;
       - delay: !lambda |-
-          ESP_LOGD("rhi", "delay: %d", retransmit_delay);
           return retransmit_delay;
       - lambda: |-
-          ESP_LOGD("rhi", "resend: %d", max_repeat);
-          if (max_repeat > 1) {
-            id(send_packet_data).execute(packet_data, packet_size, max_repeat - 1, retransmit_delay);
-          } else if (max_repeat == 1) {
-            id(send_packet_data).execute(packet_data, packet_size, 0, 0);  // last transmit; don't wait after transmit
+          if (transmit_count > 1) {
+            // Queue next transmission with delay
+            id(send_packet_data).execute(packet_data, transmit_count - 1, retransmit_delay);
           }
 
 
@@ -398,25 +394,25 @@ script:
     parameters:
       payload: uint8_t*
       payload_size: uint8_t
-      max_repeat: uint8_t   # generate packet data once and transmit max_repeat times
+      end_byte: uint8_t
+      transmit_count: uint8_t   # generate packet data once and transmit exactly this many times
       retransmit_delay: uint8_t
     then:
       - lambda: |-
+          ESP_LOGD("itho", "Send message: %s", format_hex_pretty(payload, payload_size).c_str());
+
           // Encode message with Manchester-like encoding
-          // Start with message header (sync_bytes + header)
-          // Note: CC1101 will automatically add 8 bytes of 0xAA preamble (num_preamble: 4)
-          std::array<uint8_t, 63> packet_data = {0};
-          for (int i = 0; i < sizeof(id(sync_bytes)); i++) {
-            packet_data[i] = id(sync_bytes)[i];
-          }
-          for (int i = 0; i < sizeof(id(itho_header)); i++) {
-            packet_data[sizeof(id(sync_bytes)) + i] = (id(itho_header)[i]);
+          // Start with message header
+          // Note: CC1101 will automatically add 8 bytes of 0xAA preamble (num_preamble: 4) and sync bytes (sync1 and sync0)
+          std::vector<uint8_t> packet_data(63, 0);  // Initialize vector with 63 zeros
+          uint8_t out_bytecounter{0};
+          for (; out_bytecounter < sizeof(id(itho_header)); out_bytecounter++) {
+            packet_data[out_bytecounter] = (id(itho_header)[out_bytecounter]);
           }
           // Encoded buffer starts after the sync + header)
 
           // Manchester-like encoding of payload
           // Pattern: for each data bit, insert 1-0 pattern every 8 bits
-          uint8_t out_bytecounter = sizeof(id(sync_bytes)) + sizeof(id(itho_header));
           uint8_t out_bitcounter = 0;           // Bit position within current output byte (0-7)
           uint8_t out_patterncounter = 0;       // Bit counter to add "10" pattern after every 8 bits
           uint8_t bitSelect = 4;                // Bit position of the input byte (4-7, 0-3)
@@ -442,7 +438,8 @@ script:
                 packet_data[out_bytecounter] |= (1 << out_shift);
                 out_shift--;
                 out_bitcounter++;
-                packet_data[out_bytecounter] |= (0 << out_shift);
+                // Note: To set bit to 0, correct operation would be: packet_data[out_bytecounter] &= ~(1 << out_shift);
+                // However, packet_data is zero-initialized, so this is a no-op and omitted for clarity
                 if (out_shift == 0) {
                   out_shift = 8;
                 }
@@ -500,7 +497,7 @@ script:
           }
 
           if (out_bytecounter < 63) {
-            packet_data[out_bytecounter] = 0xAC;
+            packet_data[out_bytecounter] = end_byte;
             out_bytecounter++;
           }
 
@@ -509,9 +506,9 @@ script:
             out_bytecounter++;
           }
 
-          ESP_LOGD("itho", "size: %d, raw packet: %s", out_bytecounter, format_hex_pretty(packet_data.data(), packet_data.size()).c_str());
+          ESP_LOGD("itho", "Send: %d times; %d delay, data: %s", transmit_count, retransmit_delay, format_hex_pretty(packet_data.data(), packet_data.size()).c_str());
 
-          id(send_packet_data).execute(packet_data.data(), packet_data.size(), max_repeat, retransmit_delay);
+          id(send_packet_data).execute(packet_data, transmit_count, retransmit_delay);
 
   # Script to send a command (Low/Medium/High - sends 3 times)
   - id: send_command
@@ -520,6 +517,16 @@ script:
       command_byte: uint8_t
     then:
       - lambda: |-
+          // Increment packet counter and log
+          id(packet_counter)++;
+          const char* command_name = 
+            (command_byte == 0x02) ? "Low" :
+            (command_byte == 0x03) ? "Medium" :
+            (command_byte == 0x04) ? "High" : "Unknown";
+          ESP_LOGI("itho", "Sending %s command (counter=%d)", command_name, id(packet_counter));
+          id(last_command).publish_state(command_name);
+          id(controller_name).publish_state("${device_name}");
+
           // Build command payload
           std::array<uint8_t, 12> payload;
           // Byte 0: device type
@@ -545,7 +552,7 @@ script:
           }
           payload[11] = 0 - sum;
 
-          id(send_payload).execute(payload.data(), payload.size(), 3, 40);
+          id(send_payload).execute(payload.data(), payload.size(), 0xAC, 3, 40);
 
 
   # Script to send a join command (used for pairing - sends 3 times)
@@ -553,6 +560,10 @@ script:
     mode: single
     then:
       - lambda: |-
+          // Increment packet counter and log
+          id(packet_counter)++;
+          ESP_LOGI("itho", "Sending Join command (counter=%d)", id(packet_counter));
+          
           // Build command payload
           std::array<uint8_t, 21> payload;
           // Byte 0: device type
@@ -591,13 +602,17 @@ script:
           for (int i = 0; i < 20; i++) sum += payload[i];
           payload[20] = (uint8_t)(0x100 - (sum & 0xFF));
 
-          id(send_payload).execute(payload.data(), payload.size(), 3, 40);
+          id(send_payload).execute(payload.data(), payload.size(), 0xCA, 3, 40);
 
   # Script to send a leave command (used for pairing - sends 3 times)
   - id: send_leave_command
     mode: single
     then:
       - lambda: |-
+          // Increment packet counter and log
+          id(packet_counter)++;
+          ESP_LOGI("itho", "Sending Leave command (counter=%d)", id(packet_counter));
+          
           // Build command payload
           std::array<uint8_t, 15> payload;
           // Byte 0: device type
@@ -627,8 +642,7 @@ script:
           payload[14] = (uint8_t)(0x100 - (sum & 0xFF));
 
           // the leave command needs to be transmitted for 1 second
-          id(send_payload).execute(payload.data(), payload.size(), 30, 4);
-
+          id(send_payload).execute(payload.data(), payload.size(), 0xCA, 30, 4);
 
   # inspired by https://karlquinsland.com/esphome-dynamic-timer/
   - id: timer_tick

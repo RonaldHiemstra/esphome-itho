@@ -2,6 +2,8 @@
 
 This project monitors and controls an ITHO mechanical ventilation system using an ESP32 with CC1101 RF transceiver and ESPHome firmware. The system can receive and decode RF commands from ITHO remotes and monitor the ventilation unit's status.
 
+**Project Status:** ✅ **Fully Functional** - Pairing, command transmission (Low/Medium/High), and status monitoring are all working reliably.
+
 **Based on:**
 
 - [ESPHome CC1101 Component](https://esphome.io/components/cc1101/) (official support since v2025.12)
@@ -26,18 +28,63 @@ The ITHO ventilation system uses the following RF parameters (derived from IthoC
 | Whitening           | Disabled        | Raw data                               |
 | Encoding            | Manchester-like | Even bits extracted from 10-bit groups |
 
+## Multi-Device Configuration
+
+This configuration is designed to be easily deployed across multiple ESP32 devices. The YAML file uses ESPHome substitutions to prefix all entity IDs, preventing conflicts in Home Assistant.
+
+**To use this configuration on multiple devices:**
+
+1. Copy the entire YAML file
+2. Update the **device-specific section** at the top (everything before the `globals:` section):
+   - `substitutions.device_name` - Unique hostname (e.g., `itho-kitchen`, `itho-bathroom`)
+     - **Must use hyphens only** (no underscores) per RFC hostname standards
+   - `substitutions.device_prefix` - Unique prefix for entity IDs (e.g., `itho_kitchen`, `itho_bathroom`)
+     - **Must use underscores** to match the device_name but with underscores instead of hyphens
+   - `esphome.friendly_name` - Human-readable name
+   - GPIO pins if your wiring differs
+   - MQTT log topic if desired
+3. The **shared configuration** (from `globals:` to the end) can be copied as-is
+
+**Example for a second device:**
+
+```yaml
+substitutions:
+  device_name: itho-bathroom          # Hyphens for hostname
+  device_prefix: itho_bathroom        # Underscores for IDs
+
+esphome:
+  name: ${device_name}
+  friendly_name: ITHO Bathroom Ventilation
+  # ... rest of device-specific config
+```
+
+All sensors, buttons, and scripts will automatically use the prefix, creating unique entity IDs like:
+
+- `itho_bathroom_fan_speed`
+- `itho_bathroom_last_command`
+- `itho_bathroom_send_command`
+
+This ensures multiple devices can coexist in Home Assistant without ID conflicts.
+
 ## Features
+
+### ✅ Fully Working
 
 - **Receive RF commands** from ITHO remote controls (Low, Medium, High, Timer)
 - **Timer countdown display** - Shows remaining time when timer mode is activated (10/20/30 minutes)
 - **Remote ID whitelist** - Only accept commands from authorized remotes (security feature)
-- **Transmit commands** to control ventilation speed (Low, Medium, High)
-- **Pairing support** to register ESP32 as a remote control - **TODO: Not yet working, debugging needed!**
+- **Transmit commands** to control ventilation speed (Low, Medium, High) - each command is transmitted exactly 3 times with 40ms delay between transmissions
+- **Pairing support** - Register ESP32 as a remote control with Join command (3 transmissions) and Leave command (30 transmissions with 4ms delay between each, plus transmission overhead - approximately 1 second total per ITHO specification)
 - **Monitor ventilation unit status** via hardwired switch position and actual fan speed
 - **Real-time fan speed monitoring** - Displays current ventilation speed as percentage
 - **MQTT integration** for standalone operation (works even when Home Assistant is down)
 - **Over-the-air (OTA) updates** for firmware maintenance
 - **Web interface** on port 80 for monitoring and diagnostics
+
+### 🔄 Future Enhancements
+
+- **Timer transmission** - Currently only receives/displays timer commands; cannot transmit them yet
+- **Humidity sensor monitoring** - Decode and display humidity measurements from ventilation unit status broadcasts (unit periodically transmits this data)
 
 ## Hardware
 
@@ -65,14 +112,27 @@ To use the ESP32 as a remote control, you must first pair it with your ITHO vent
 
 3. **Wait for confirmation:**
    - The unit should shortly vary the fan speed to confirm pairing
-   - Check the ESP32 logs for "Sending join command"
-   - The device ID will be automatically generated from the ESP32 MAC address
+   - Check the ESP32 logs for "Sending Join command (counter=X)"
+   - The device ID is automatically generated from the last 3 bytes of the ESP32 MAC address
+   - The join packet is transmitted 3 times with 40ms delay between transmissions
 
 4. **Test the pairing:**
    - Press "Low", "Medium", or "High" buttons
    - The ventilation speed should change accordingly
+   - Each command is transmitted exactly 3 times to ensure reliable reception
 
-**Note:** The ESP32 will remember its device ID between reboots. If pairing fails, you may need to reset the ventilation unit and try again.
+**Success indicators:**
+
+- The ventilation unit will briefly change fan speeds (usually a quick ramp up/down) to acknowledge successful pairing
+- After pairing, all speed control commands (Low/Medium/High) should work reliably
+- The ESP32 logs will show "Sending Join command (counter=X)" followed by the encoded packet
+
+**Notes:**
+
+- The ESP32 remembers its device ID and packet counter between reboots
+- The packet counter increments with each command to prevent replay attacks
+- The device ID is derived from the last 3 bytes of the ESP32's MAC address, ensuring uniqueness
+- If pairing fails, verify the unit is in pairing mode and try again within the 2-minute window
 
 ## Controlling the Ventilation
 
@@ -107,39 +167,53 @@ The configuration includes a whitelist of authorized devices. This applies to bo
 - **Remote controls** (e.g., bathroom wall switches)
 - **Ventilation unit** (for status broadcasts)
 
-Only packets from whitelisted devices will be processed. Configure the whitelist in two places:
+Only packets from whitelisted devices will be processed. The whitelist is configured in the **device-specific section** at the top of the YAML file using `std::vector<std::string>` globals:
 
 **For status packets from the ventilation unit:**
 
 ```yaml
-struct {
-  uint8_t id[3];
-  const char* room_name;
-} allowed_remotes[] = {
-  {{0x94, 0xD8, 0xF9}, "Ventilatie unit"},
-};
+globals:
+  - id: allowed_units_config
+    type: std::vector<std::string>
+    restore_value: no
+    initial_value: '{"94.D8.F9 Ventilatie unit"}'
 ```
 
 **For remote controls:**
 
 ```yaml
-struct {
-  uint8_t id[3];
-  const char* room_name;
-} allowed_remotes[] = {
-  {{0x51, 0x36, 0x35}, "Badkamer"},
-  // Add more remotes here
-};
+globals:
+  - id: allowed_remotes_config
+    type: std::vector<std::string>
+    restore_value: no
+    initial_value: '{"51.36.35 Badkamer", "5F.53.40 Home assistant", "A8.86.D4 ESP test remote"}'
 ```
 
-To add a new device:
+**Format:** Each entry is `"XX.YY.ZZ Device Name"` where:
+
+- `XX.YY.ZZ` is the 3-byte device ID in hexadecimal format (with periods)
+- Device Name is a descriptive label (everything after the first space)
+
+**To add a new device:**
 
 1. Monitor ESP32 logs while the device transmits
 2. Look for warnings like:
-   - `Ignored packet from unknown control unit: XX.XX.XX` (for ventilation unit)
-   - `Ignored packet from unknown remote unit: XX.XX.XX` (for remote controls)
-3. Add the device ID to the appropriate `allowed_remotes` array
+   - `Ignored packet from unknown ventilation unit: XX.YY.ZZ`
+   - `Ignored packet from unknown remote: XX.YY.ZZ`
+3. Add the device ID to the appropriate vector in the globals section:
+
+   ```yaml
+   initial_value: '{"51.36.35 Badkamer", "5F.53.40 Home assistant", "A8.86.D4 ESP test remote", "XX.YY.ZZ New Device"}'
+   ```
+
 4. Recompile and upload the firmware
+
+**Advantages of this approach:**
+
+- No C++ code modification needed - just edit the YAML configuration
+- Easy to add/remove devices without understanding lambda functions
+- Device names are displayed in logs for easier troubleshooting
+- All device-specific configuration is in one place at the top of the file
 
 This prevents unauthorized RF devices from controlling your ventilation system.
 
@@ -197,9 +271,11 @@ The complete configuration is in [itho-ventilation.yaml](itho-ventilation.yaml) 
 
 1. **CC1101 Component** - Configures RF transceiver with ITHO-specific parameters
 2. **Packet Decoder Lambda** - Implements Manchester-like decoding starting from STARTBYTE=5 (after 5-byte ITHO header)
-3. **Command Detection** - Pattern matching for remote commands and status messages
-4. **MQTT Integration** - Publishes state to Home Assistant via MQTT
-5. **Text Sensors** - Exposes current command and last command states
+3. **Manchester Encoder Lambda** - Encodes payload data with ITHO's custom Manchester-like encoding for transmission
+4. **Command Detection** - Pattern matching for remote commands and status messages
+5. **Queued Transmission System** - Ensures reliable command delivery with configurable repeat count and delay
+6. **MQTT Integration** - Publishes state to Home Assistant via MQTT
+7. **Text Sensors** - Exposes current command, control source, and timer countdown
 
 ### Key Implementation Details
 
@@ -213,16 +289,38 @@ The complete configuration is in [itho-ventilation.yaml](itho-ventilation.yaml) 
 
 **Preamble Handling:** The CC1101 automatically adds 8 bytes via the `num_preamble: 4` setting. While the original ITHO specification calls for 7 bytes, receivers typically tolerate one extra preamble byte without issues.
 
+**Transmission System:**
+
+The implementation uses a queued script architecture to ensure reliable command delivery:
+
+1. **send_payload** - Encodes the command payload using ITHO's Manchester-like encoding into a 63-byte packet stored in a `std::vector<uint8_t>`
+2. **send_packet_data** - Queued script that transmits the packet, waits for the specified delay, then recursively queues the next transmission
+3. **Memory Safety** - Using `std::vector` as a parameter ensures the packet data is copied by value for each queued execution, preventing use-after-free bugs
+
+Transmission parameters:
+
+- **Standard commands** (Low/Medium/High): 3 transmissions with 40ms delay
+- **Join command**: 3 transmissions with 40ms delay
+- **Leave command**: 30 transmissions with 4ms delay (approximately 1 second total)
+
+The `transmit_count` parameter specifies exactly how many times to send the packet - not how many repeats after the first transmission.
+
 **Command Detection Logic:**
 
 ```text
 1. Validate minimum decoded packet length (≥14 bytes)
 2. Check if status packet (byte[0]==0x1A && byte[12]==0x06)
    → Parse speed from byte[13]
+   → Update fan_speed sensor with percentage (0x00-0xC8(=200) mapped to 0-100%)
+   → Clear last_command if speed no longer matches
 3. Check if remote command (byte[5]==0x22 && byte[7]==0x03)
-   → Timer: byte[6]==0xF3
-   → Low/Med/High: byte[6]==0xF1, distinguished by byte[9]
+   → Verify device ID against whitelist (bytes[1-3])
+   → Timer: byte[6]==0xF3, extract duration from byte[10] (0x0A/0x14/0x1E)
+   → Low/Med/High: byte[6]==0xF1, distinguished by byte[9] (0x02/0x03/0x04)
+   → Update controller_name and last_command sensors
 ```
+
+**Packet Counter:** Each transmitted command includes a counter value (byte[4]) that increments with each button press. This counter is persisted across reboots and helps the ventilation unit detect duplicate packets.
 
 **Home Assistant Integration:**
 
@@ -299,7 +397,8 @@ package "ITHO Ventilation Control" {
 
 ## Known Limitations
 
-- **Pairing not yet working** - The pairing sequence is implemented but doesn't successfully register with the ventilation unit. Needs debugging and finalize this feature
-- **RF noise** - The receiver may pick up interference from nearby RF sources. Hardware filtering or antenna placement may help
-- **Pairing procedure varies** - Different ITHO models have different pairing methods; consult your manual
-- **Remote ID whitelist** - Must manually add new remote IDs to configuration
+- **RF noise** - The receiver may pick up interference from nearby RF sources. Hardware filtering or antenna placement may help. Non-ITHO packets with RSSI < -90 dBm are silently ignored.
+- **Pairing procedure varies** - Different ITHO models have different pairing methods; consult your unit's manual for specific instructions
+- **Remote ID whitelist** - Must manually add new remote IDs to configuration and recompile firmware (device IDs are logged when unknown devices transmit)
+- **Timer transmission** - The ESP32 can only receive and display timer commands from original ITHO remotes. It cannot yet transmit timer commands (only Low/Medium/High and Join/Leave are supported).
+- **Model compatibility** - Tested with ITHO Daalderop CVE-S ECO; other models may require timing or encoding adjustments
