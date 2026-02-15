@@ -77,14 +77,15 @@ This ensures multiple devices can coexist in Home Assistant without ID conflicts
 - **Pairing support** - Register ESP32 as a remote control with Join command (3 transmissions) and Leave command (30 transmissions with 4ms delay between each, plus transmission overhead - approximately 1 second total per ITHO specification)
 - **Monitor ventilation unit status** via hardwired switch position and actual fan speed
 - **Real-time fan speed monitoring** - Displays current ventilation speed as percentage
+- **Humidity monitoring** - Receives and displays humidity measurements from ventilation unit broadcasts (unit periodically transmits this data)
 - **MQTT integration** for standalone operation (works even when Home Assistant is down)
 - **Over-the-air (OTA) updates** for firmware maintenance
 - **Web interface** on port 80 for monitoring and diagnostics
+- **Debug logging** - Unknown ITHO messages are captured for analysis and protocol development
 
 ### 🔄 Future Enhancements
 
 - **Timer transmission** - Currently only receives/displays timer commands; cannot transmit them yet
-- **Humidity sensor monitoring** - Decode and display humidity measurements from ventilation unit status broadcasts (unit periodically transmits this data)
 
 ## Hardware
 
@@ -242,18 +243,31 @@ Example decoded packet (High command):
 
 ### Status Packets
 
-The ventilation unit broadcasts status messages showing actual fan speed:
+The ventilation unit broadcasts two types of status messages:
+
+#### Fan Speed Status
 
 **Format:** `1A.94.D8.F9.94.D8.F9.XX.31.D9.11.00.06.YY.00...`
 
 - Byte 0: `0x1A` - Status message identifier
 - Byte 7: Message counter (increments)
-- Byte 12: `0x06` - Status message type
+- Byte 12: `0x06` - Speed status message type
 - Byte 13 (YY): Speed indicator:
   - `0x30-0x37` (48-55): Low speed (wired switch position 1)
   - `0x38-0x7F` (56-127): Medium speed (wired switch position 2 - auto mode)
   - `0x80+` (128+): High speed (wired switch position 3)
   - `0x11-0x1F`: Transient values during speed changes (ignored)
+
+#### Humidity Status
+
+**Format:** `18.94.D8.F9.94.D8.F9.31.DA.1D.00.EF.00.7F.FF.3A.YY....`
+
+- Byte 0: `0x18` - Humidity message identifier
+- Bytes 1-3: Device ID (e.g., `94.D8.F9` for ventilation unit)
+- Byte 12: `0x00` - Humidity status message type
+- Byte 15 (YY): Relative humidity percentage (0-100)
+
+The ventilation unit periodically broadcasts humidity readings from its internal sensor.
 
 ### Wired Switch Positions
 
@@ -309,15 +323,21 @@ The `transmit_count` parameter specifies exactly how many times to send the pack
 
 ```text
 1. Validate minimum decoded packet length (≥14 bytes)
-2. Check if status packet (byte[0]==0x1A && byte[12]==0x06)
+2. Check if humidity packet (byte[0]==0x18 && byte[12]==0x00)
+   → Verify device ID against unit whitelist (bytes[1-3])
+   → Parse humidity from byte[15] (0-100%)
+   → Update humidity sensor
+3. Check if speed status packet (byte[0]==0x1A && byte[12]==0x06)
+   → Verify device ID against unit whitelist (bytes[1-3])
    → Parse speed from byte[13]
    → Update fan_speed sensor with percentage (0x00-0xC8(=200) mapped to 0-100%)
    → Clear last_command if speed no longer matches
-3. Check if remote command (byte[5]==0x22 && byte[7]==0x03)
-   → Verify device ID against whitelist (bytes[1-3])
+4. Check if remote command (byte[5]==0x22 && byte[7]==0x03)
+   → Verify device ID against remote whitelist (bytes[1-3])
    → Timer: byte[6]==0xF3, extract duration from byte[10] (0x0A/0x14/0x1E)
    → Low/Med/High: byte[6]==0xF1, distinguished by byte[9] (0x02/0x03/0x04)
    → Update controller_name and last_command sensors
+5. Unknown packets → Logged to unknown_message sensor for debugging
 ```
 
 **Packet Counter:** Each transmitted command includes a counter value (byte[4]) that increments with each button press. This counter is persisted across reboots and helps the ventilation unit detect duplicate packets.
@@ -326,11 +346,17 @@ The `transmit_count` parameter specifies exactly how many times to send the pack
 
 - Sensors:
   - `fan_speed` - Current fan speed percentage (0-100%)
+  - `humidity` - Relative humidity percentage from ventilation unit
+  - `uptime` - Device uptime in seconds
+  - `wifi_signal` - WiFi signal strength
+- Text Sensors:
   - `last_command` - Last received command (Low/Medium/High/Timer)
   - `controller_name` - Source of last command (e.g., "Badkamer" or "Ventilatie unit")
   - `timer` - Timer countdown display (MM:SS format, or "Off" when inactive)
+  - `unknown_message` - Debug sensor showing unrecognized ITHO packets
 - MQTT topics under `esp/` prefix
 - State changes published immediately
+- Logger level set to INFO for production use (change to DEBUG for troubleshooting)
 
 ## Hardware Components
 
@@ -394,6 +420,44 @@ package "ITHO Ventilation Control" {
 - **Advanced automation** - Schedule ventilation based on time or sensor data
 - **Energy monitoring** - Track power consumption
 - **Enclosure design** - 3D-printed case for clean installation
+
+## MQTT Configuration
+
+### ESP-IDF Framework Considerations
+
+This project uses the ESP-IDF framework (not Arduino), which requires specific MQTT settings for stable operation:
+
+```yaml
+mqtt:
+  broker: !secret mqtt_broker
+  username: !secret mqtt_username
+  password: !secret mqtt_password
+  log_topic: esp/logs/${device_name}
+  idf_send_async: false  # Important for ESP-IDF: send messages synchronously
+```
+
+**Key setting:** `idf_send_async: false` ensures MQTT messages are sent synchronously, preventing the message queue from overwhelming the broker during the initial connection burst when the device publishes all its discovery and state messages.
+
+### Mosquitto Broker Configuration
+
+If using Mosquitto broker (v2.0+), you may need to adjust the receive maximum limit to prevent disconnections:
+
+**Symptom:** Device repeatedly connects and disconnects every ~10 seconds with errors like:
+
+- Broker logs: `Client disconnected due to exceeding the receive maximum`
+- ESP logs: `Last error code reported from esp-tls: 0x8008`, `TCP disconnected`
+
+**Solution:** Add to your `mosquitto.conf`:
+
+```conf
+max_inflight_messages 100
+# Or disable the limit entirely:
+# max_inflight_messages 0
+```
+
+Then restart mosquitto: `sudo systemctl restart mosquitto`
+
+**Explanation:** MQTT 5.0 introduced a "Receive Maximum" property that limits how many QoS > 0 messages can be in-flight. ESPHome devices can exceed the default limit (typically 20) during initial connection when publishing all their discovery messages and retained states. Setting this to 100 or 0 (unlimited) prevents the broker from forcibly disconnecting the client.
 
 ## Known Limitations
 
