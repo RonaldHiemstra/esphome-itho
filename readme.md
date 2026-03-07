@@ -74,7 +74,7 @@ This ensures multiple devices can coexist in Home Assistant without ID conflicts
 - **Timer countdown display** - Shows remaining time when timer mode is activated (10/20/30 minutes)
 - **Remote ID whitelist** - Only accept commands from authorized remotes (security feature)
 - **Transmit commands** to control ventilation speed (Low, Medium, High) - each command is transmitted exactly 3 times with 40ms delay between transmissions
-- **Pairing support** - Register ESP32 as a remote control with Join command (3 transmissions) and Leave command (30 transmissions with 4ms delay between each, plus transmission overhead - approximately 1 second total per ITHO specification)
+- **Pairing support** - Register ESP32 as a remote control with Join command (10 transmissions) and Leave command (30 transmissions with 4ms delay between each, plus transmission overhead - approximately 1 second total per ITHO specification)
 - **Monitor ventilation unit status** via hardwired switch position and actual fan speed
 - **Real-time fan speed monitoring** - Displays current ventilation speed as percentage
 - **Humidity monitoring** - Receives and displays humidity measurements from ventilation unit broadcasts (unit periodically transmits this data)
@@ -103,30 +103,32 @@ The ESP32 with CC1101 acts as an additional remote control, allowing integration
 To use the ESP32 as a remote control, you must first pair it with your ITHO ventilation unit:
 
 1. **Put the ventilation unit in pairing mode:**
-   - Turn the unit off at the breaker
-   - Wait for 15 seconds
+   - Turn the unit off at the breaker (or the unit's power switch)
+   - Wait for 15 seconds for capacitors to discharge
    - Turn it back on
-   - For 2 minutes, the unit will be in pairing mode
+   - The unit will be in pairing mode for approximately 2 minutes
    - *Note: Exact procedure varies by model - consult your unit's manual*
 
-2. **Press the "Pair Remote" button** in Home Assistant or the web interface
-
-3. **Wait for confirmation:**
-   - The unit should shortly vary the fan speed to confirm pairing
-   - Check the ESP32 logs for "Sending Join command (counter=X)"
+2. **Immediately press the "Pair Remote" button** in Home Assistant or the web interface
+   - The join packet is transmitted **10 times** with 40ms delay between transmissions for reliable reception
    - The device ID is automatically generated from the last 3 bytes of the ESP32 MAC address
-   - The join packet is transmitted 3 times with 40ms delay between transmissions
+   - The ESP32 logs will show `Sending Join command (counter=X)` with the device ID
+
+3. **Watch for confirmation in the ESP32 logs:**
+   - A successful pairing causes the unit to briefly vary the fan speed
+   - If `allowed_units_config` is configured with your unit's device ID, the logs will show
+     `Received fan speed: X.X (Source: Your Unit)` indicating the speed change
+   - If the unit ID is **not yet** in `allowed_units_config`, the logs will show:
+     ```
+     Received packet from unknown ventilation unit: XX.YY.ZZ
+       → To enable monitoring, add "XX.YY.ZZ Your Unit" to allowed_units_config
+     ```
+     Note the `XX.YY.ZZ` value — **this is your unit's device ID**. Add it to
+     `allowed_units_config` in the YAML configuration to enable fan speed monitoring.
 
 4. **Test the pairing:**
    - Press "Low", "Medium", or "High" buttons
    - The ventilation speed should change accordingly
-   - Each command is transmitted exactly 3 times to ensure reliable reception
-
-**Success indicators:**
-
-- The ventilation unit will briefly change fan speeds (usually a quick ramp up/down) to acknowledge successful pairing
-- After pairing, all speed control commands (Low/Medium/High) should work reliably
-- The ESP32 logs will show "Sending Join command (counter=X)" followed by the encoded packet
 
 **Notes:**
 
@@ -134,6 +136,7 @@ To use the ESP32 as a remote control, you must first pair it with your ITHO vent
 - The packet counter increments with each command to prevent replay attacks
 - The device ID is derived from the last 3 bytes of the ESP32's MAC address, ensuring uniqueness
 - If pairing fails, verify the unit is in pairing mode and try again within the 2-minute window
+- You can press "Pair Remote" multiple times within the pairing window to improve reliability
 
 ## Controlling the Ventilation
 
@@ -199,8 +202,8 @@ globals:
 
 1. Monitor ESP32 logs while the device transmits
 2. Look for warnings like:
-   - `Ignored packet from unknown ventilation unit: XX.YY.ZZ`
-   - `Ignored packet from unknown remote: XX.YY.ZZ`
+   - `Received packet from unknown ventilation unit: XX.YY.ZZ`
+   - `Ignored packet from unknown remote unit: XX.YY.ZZ`
 3. Add the device ID to the appropriate vector in the globals section:
 
    ```yaml
@@ -314,7 +317,7 @@ The implementation uses a queued script architecture to ensure reliable command 
 Transmission parameters:
 
 - **Standard commands** (Low/Medium/High): 3 transmissions with 40ms delay
-- **Join command**: 3 transmissions with 40ms delay
+- **Join command**: 10 transmissions with 40ms delay
 - **Leave command**: 30 transmissions with 4ms delay (approximately 1 second total)
 
 The `transmit_count` parameter specifies exactly how many times to send the packet - not how many repeats after the first transmission.
