@@ -1,6 +1,7 @@
 substitutions:
   device_name: itho-ventilation  # Used for hostname (must use hyphens, no underscores)
   device_prefix: "ITHO"          # Unique prefix, used for entity names (home assistant IDs) (underscores allowed)
+  pairing_mode: "both"           # Pairing mode: "standard", "compat", or "both"
 
 esphome:
   name: ${device_name}
@@ -55,6 +56,13 @@ wifi:
 # followed by a space and then the device name/description
 
 globals:
+  # Pairing mode for the Pair Remote button.
+  # standard = send Join only, compat = send Join2 only, both = send Join + Join2.
+  - id: pairing_mode_config
+    type: std::string
+    restore_value: no
+    initial_value: '"${pairing_mode}"'
+
   # ALLOWED REMOTE IDs (Physical remotes and virtual remotes like Home Assistant)
   - id: allowed_remotes_config
     type: std::vector<std::string>
@@ -221,7 +229,8 @@ cc1101:
 
             if (decoded[0] == 0x18) {
               ESP_LOGI("itho", "Received message: %s", format_hex_pretty(decoded, decoded_len).c_str());
-              ESP_LOGI("itho", "Received humidity: %.d (Source: %s)", decoded[15], source_name.c_str());
+              ESP_LOGI("itho", "Received humidity: %u (Source: %s)",
+                       static_cast<unsigned>(decoded[15]), source_name.c_str());
               id(humidity).publish_state(decoded[15]);
               return;
             }
@@ -359,7 +368,7 @@ button:
     icon: "mdi:link-plus"
     on_press:
       - script.execute:
-          id: send_join_command
+          id: send_pair_sequence
 
   - platform: template
     name: "${device_prefix} Leave Remote"
@@ -397,6 +406,50 @@ button:
 
 # Scripts
 script:
+  # Compatibility pairing sequence for older/variant ITHO receivers.
+  # Sends standard Join and then alternative Join2 used by some remotes.
+  - id: send_pair_sequence
+    mode: single
+    then:
+      - lambda: |-
+          ESP_LOGI("itho", "Pairing mode: %s", id(pairing_mode_config).c_str());
+      - if:
+          condition:
+            lambda: |-
+              return id(pairing_mode_config) == "standard";
+          then:
+            - script.execute:
+                id: send_join_command
+      - if:
+          condition:
+            lambda: |-
+              return id(pairing_mode_config) == "compat";
+          then:
+            - script.execute:
+                id: send_join2_command
+      - if:
+          condition:
+            lambda: |-
+              return id(pairing_mode_config) == "both";
+          then:
+            - script.execute:
+                id: send_join_command
+            - delay: 200ms
+            - script.execute:
+                id: send_join2_command
+      - if:
+          condition:
+            lambda: |-
+              return id(pairing_mode_config) != "standard" && id(pairing_mode_config) != "compat" && id(pairing_mode_config) != "both";
+          then:
+            - lambda: |-
+                ESP_LOGW("itho", "Unknown pairing_mode '%s', falling back to 'both'", id(pairing_mode_config).c_str());
+            - script.execute:
+                id: send_join_command
+            - delay: 200ms
+            - script.execute:
+                id: send_join2_command
+
   - id: send_packet_data
     mode: queued
     parameters:
@@ -609,6 +662,56 @@ script:
           payload[8] = 0x00;
           payload[9] = 0x22;
           payload[10] = 0xF1;
+
+          // Bytes 11-13: deviceId again
+          payload[11] = id(my_device_id)[3];
+          payload[12] = id(my_device_id)[4];
+          payload[13] = id(my_device_id)[5];
+
+          // Bytes 14-16: Fixed values
+          payload[14] = 0x01;
+          payload[15] = 0x10;
+          payload[16] = 0xE0;
+
+          // Bytes 17-19: deviceId again
+          payload[17] = id(my_device_id)[3];
+          payload[18] = id(my_device_id)[4];
+          payload[19] = id(my_device_id)[5];
+
+          // Byte 20: Counter2 (CRC) - sum of bytes 0-19 subtracted from 0
+          uint8_t sum = 0;
+          for (int i = 0; i < 20; i++) sum += payload[i];
+          payload[20] = (uint8_t)(0x100 - (sum & 0xFF));
+
+          id(send_payload).execute(payload.data(), payload.size(), 0xCA, 3, 40);
+
+  # Script to send the alternative join command used by some ITHO variants
+  # (ESPEasy ithoMessageJoin2CommandBytes: 1F C9 0C 63 22 F8).
+  - id: send_join2_command
+    mode: single
+    then:
+      - lambda: |-
+          // Increment packet counter and log
+          id(packet_counter)++;
+          ESP_LOGI("itho", "Sending Join2 (compat) command (counter=%d)", id(packet_counter));
+
+          // Build command payload
+          std::array<uint8_t, 21> payload;
+          // Byte 0: device type
+          payload[0] = id(device_type);
+          // Bytes 1-3: deviceId
+          payload[1] = id(my_device_id)[3];
+          payload[2] = id(my_device_id)[4];
+          payload[3] = id(my_device_id)[5];
+          payload[4] = id(packet_counter);
+
+          // Bytes 5-10: Alternative Join2 command bytes (ithoMessageJoin2CommandBytes)
+          payload[5] = 0x1F;
+          payload[6] = 0xC9;
+          payload[7] = 0x0C;
+          payload[8] = 0x63;
+          payload[9] = 0x22;
+          payload[10] = 0xF8;
 
           // Bytes 11-13: deviceId again
           payload[11] = id(my_device_id)[3];
