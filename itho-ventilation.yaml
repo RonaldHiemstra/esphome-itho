@@ -374,6 +374,11 @@ text_sensor:
     id: unknown_message
     icon: "mdi:alert"
 
+  - platform: version
+    name: "${device_prefix} ESPHome Version"
+    hide_timestamp: true
+    hide_hash: true
+
 # Buttons for pairing and control
 button:
   - platform: template
