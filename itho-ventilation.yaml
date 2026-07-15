@@ -256,6 +256,10 @@ cc1101:
                 if (id(last_command).state != "Low") {
                   id(last_command).publish_state("");
                 }
+              } else {
+                if (id(last_command).state != "Standby") {
+                  id(last_command).publish_state("");
+                }
               }
               return;
             }
@@ -267,6 +271,7 @@ cc1101:
           }
           // Remote command packets: check bytes 5-10 against command patterns
           // Based on IthoCC1101::checkIthoCommand() and command byte arrays
+          // Standby:0x22, 0xF1, 0x03, 0x00, 0x01, 0x04
           // Low:    0x22, 0xF1, 0x03, 0x00, 0x02, 0x04
           // Medium: 0x22, 0xF1, 0x03, 0x00, 0x03, 0x04
           // High:   0x22, 0xF1, 0x03, 0x00, 0x04, 0x04
@@ -298,11 +303,13 @@ cc1101:
                 id(timer_tick).execute();  // Start the timer
               }
             }
-            // Low/Medium/High: byte[6]==0xF1, byte[10]==0x04
+            // Standby/Low/Medium/High: byte[6]==0xF1, byte[10]==0x04
             else if (decoded[6] == 0xF1 && decoded[10] == 0x04) {
               id(timeout) = 0;  // Disable the timer
               // Distinguish by byte[9]
-              if (decoded[9] == 0x02) {
+              if (decoded[9] == 0x01) {
+                command = "Standby";
+              } else if (decoded[9] == 0x02) {
                 command = "Low";
               } else if (decoded[9] == 0x03) {
                 command = "Medium";
@@ -382,6 +389,14 @@ button:
     on_press:
       - script.execute:
           id: send_leave_command
+
+  - platform: template
+    name: "${device_prefix} Standby"
+    icon: "mdi:fan-off"
+    on_press:
+      - script.execute:
+          id: send_command
+          command_byte: 0x01
 
   - platform: template
     name: "${device_prefix} Low"
@@ -597,7 +612,7 @@ script:
 
           id(send_packet_data).execute(packet_data, transmit_count, retransmit_delay);
 
-  # Script to send a command (Low/Medium/High - sends 3 times)
+  # Script to send a command (Standby/Low/Medium/High - sends 3 times)
   - id: send_command
     mode: single
     parameters:
@@ -607,6 +622,7 @@ script:
           // Increment packet counter and log
           id(packet_counter)++;
           const char* command_name = 
+            (command_byte == 0x01) ? "Standby" :
             (command_byte == 0x02) ? "Low" :
             (command_byte == 0x03) ? "Medium" :
             (command_byte == 0x04) ? "High" : "Unknown";
