@@ -460,9 +460,13 @@ script:
           then:
             - script.execute:
                 id: send_join_command
-            - delay: 600ms
+            - script.wait:
+                id: send_packet_data
+            - delay: 50ms
             - script.execute:
                 id: send_join2_command
+            - script.wait:
+                id: send_packet_data
       - if:
           condition:
             lambda: |-
@@ -472,28 +476,38 @@ script:
                 ESP_LOGW("itho", "Unknown pairing_mode '%s', falling back to 'both'", id(pairing_mode_config).c_str());
             - script.execute:
                 id: send_join_command
-            - delay: 600ms
+            - script.wait:
+                id: send_packet_data
+            - delay: 50ms
             - script.execute:
                 id: send_join2_command
+            - script.wait:
+                id: send_packet_data
 
   - id: send_packet_data
     mode: queued
+    max_runs: 8
     parameters:
       packet_data: std::vector<uint8_t>
       transmit_count: uint8_t
       retransmit_delay: uint8_t
     then:
-      - cc1101.send_packet:
-          data: !lambda |-
-            // Return the full packet data (packet_data is copied by value, safe to use)
-            return packet_data;
-      - delay: !lambda |-
-          return retransmit_delay;
-      - lambda: |-
-          if (transmit_count > 1) {
-            // Queue next transmission with delay
-            id(send_packet_data).execute(packet_data, transmit_count - 1, retransmit_delay);
-          }
+      - repeat:
+          count: !lambda |-
+            return transmit_count;
+          then:
+            - cc1101.send_packet:
+                data: !lambda |-
+                  // Return the full packet data (packet_data is copied by value, safe to use)
+                  return packet_data;
+            - if:
+                condition:
+                  lambda: |-
+                    // Avoid delaying after the final transmission in the burst.
+                    return iteration + 1 < transmit_count;
+                then:
+                  - delay: !lambda |-
+                      return retransmit_delay;
 
 
   - id: send_payload

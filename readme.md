@@ -74,8 +74,8 @@ This ensures multiple devices can coexist in Home Assistant without ID conflicts
 
 - **Receive RF commands** from ITHO remote controls (Standby, Low, Medium, High, Timer); model behavior differs, with some units exposing 3 effective levels and others 4
 - **Timer countdown display** - Shows remaining time when timer mode is activated (10/20/30 minutes)
-- **Remote Control ID whitelist** - Only accept commands from authorized remote controls (security feature)
-- **Transmit commands** to control ventilation speed (Standby, Low, Medium, High) - each command is transmitted exactly 3 times with 40ms delay between transmissions
+- **Remote Control ID whitelist** - Local filter for this ESP32: only listed remote packets update its command/state sensors; unlisted packets are ignored
+- **Transmit commands** to control ventilation speed (Standby, Low, Medium, High) - each command is transmitted exactly 3 times with 40ms delay between transmissions; overlapping requests are queued in order with capacity for 8 total bursts (1 active + 7 pending) instead of being dropped
 - **Pairing support** - Register ESP32 as a remote control using `substitutions.pairing_mode`: `standard` sends Join only (10 transmissions), `compat` sends Join2 only (10 transmissions), and the default `both` sends Join followed by Join2 (20 transmissions total). Leave command behavior is unchanged: 30 transmissions with 4ms delay between each, plus transmission overhead - approximately 1 second total per ITHO specification
 - **Monitor ventilation unit status** via hardwired switch position and actual fan speed
 - **Real-time fan speed monitoring** - Displays current ventilation speed as percentage
@@ -167,9 +167,9 @@ When a Timer command is received from an ITHO remote control, the system:
 
 **Note:** Timer mode can only be activated by original ITHO remote controls that support timer functionality. The ESP32 currently transmits Standby/Low/Medium/High commands, but not timer commands.
 
-## Remote Control ID Whitelist (Security)
+## Remote Control ID Whitelist (Local Filter)
 
-The configuration includes a whitelist of authorized devices. This applies to both:
+The configuration includes a local packet filter list for this ESP32. This applies to both:
 
 - **Remote controls** (e.g., bathroom wall switches)
 - **Ventilation unit** (for status broadcasts)
@@ -222,7 +222,7 @@ globals:
 - Device names are displayed in logs for easier troubleshooting
 - All device-specific configuration is in one place at the top of the file
 
-This prevents unauthorized RF devices from controlling your ventilation system.
+This filter only affects what this ESP32 accepts for local sensor/state updates and logs; it does not authorize or secure control of the ventilation unit itself.
 
 ## Packet Format
 
@@ -314,16 +314,17 @@ The complete configuration is in [itho-ventilation.yaml](itho-ventilation.yaml) 
 
 **Transmission System:**
 
-The implementation uses a queued script architecture to ensure reliable command delivery:
+The implementation uses a single-script burst architecture to ensure reliable command delivery and a deterministic wait barrier:
 
 1. **send_payload** - Encodes the command payload using ITHO's Manchester-like encoding into a 63-byte packet stored in a `std::vector<uint8_t>`
-2. **send_packet_data** - Queued script that transmits the packet, waits for the specified delay, then recursively queues the next transmission
-3. **Memory Safety** - Using `std::vector` as a parameter ensures the packet data is copied by value for each queued execution, preventing use-after-free bugs
+2. **send_packet_data** - Single script invocation that transmits the packet `transmit_count` times with the configured inter-packet delay inside one `repeat` block
+3. **Guaranteed Barrier** - `script.wait` on `send_packet_data` now waits for the full transmission burst to finish before continuing, which is important for `pairing_mode: both`
+4. **Memory Safety** - Using `std::vector` as a parameter ensures the packet data is copied by value for the transmission burst, preventing use-after-free bugs
 
 Transmission parameters:
 
 - **Standard commands** (Standby/Low/Medium/High): 3 transmissions with 40ms delay
-- **Join commands**: `standard` mode sends Join 10 times with 40ms delay, `compat` mode sends Join2 10 times with 40ms delay, and the default `both` mode sends Join 10 times followed by Join2 10 times with a 600ms gap between the two sequences
+- **Join commands**: `standard` mode sends Join 10 times with 40ms delay, `compat` mode sends Join2 10 times with 40ms delay, and the default `both` mode sends Join 10 times followed by Join2 10 times with a 50ms gap between the two sequences
 - **Leave command**: 30 transmissions with 4ms delay (approximately 1 second total)
 
 The `transmit_count` parameter specifies exactly how many times to send the packet - not how many repeats after the first transmission.
