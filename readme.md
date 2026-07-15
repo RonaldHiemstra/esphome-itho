@@ -14,7 +14,7 @@ This project monitors and controls an ITHO mechanical ventilation system using a
 The ITHO ventilation system uses the following RF parameters (derived from IthoCC1101.cpp):
 
 | Parameter           | Value           | Notes                                  |
-|---------------------|-----------------|----------------------------------------|
+| ------------------- | --------------- | -------------------------------------- |
 | Carrier frequency   | 868.2999 MHz    | ISM band                               |
 | Modulation          | 2-FSK           | Frequency-shift keying                 |
 | Symbol rate         | 38.383 kBaud    | MDMCFG4=0x5A, MDMCFG3=0x83             |
@@ -40,6 +40,7 @@ This configuration is designed to be easily deployed across multiple ESP32 devic
      - **Must use hyphens only** (no underscores) per RFC hostname standards
    - `substitutions.device_prefix` - Unique prefix for entity IDs (e.g., `itho_kitchen`, `itho_bathroom`)
      - **Must use underscores** to match the device_name but with underscores instead of hyphens
+   - `substitutions.pairing_mode` - Pairing mode for the Pair Remote button (`both`, `standard`, or `compat`)
    - `esphome.friendly_name` - Human-readable name
    - GPIO pins if your wiring differs
    - MQTT log topic if desired
@@ -51,6 +52,7 @@ This configuration is designed to be easily deployed across multiple ESP32 devic
 substitutions:
   device_name: itho-bathroom          # Hyphens for hostname
   device_prefix: itho_bathroom        # Underscores for IDs
+  pairing_mode: both                  # both | standard | compat
 
 esphome:
   name: ${device_name}
@@ -74,7 +76,7 @@ This ensures multiple devices can coexist in Home Assistant without ID conflicts
 - **Timer countdown display** - Shows remaining time when timer mode is activated (10/20/30 minutes)
 - **Remote ID whitelist** - Only accept commands from authorized remotes (security feature)
 - **Transmit commands** to control ventilation speed (Low, Medium, High) - each command is transmitted exactly 3 times with 40ms delay between transmissions
-- **Pairing support** - Register ESP32 as a remote control with Join command (10 transmissions) and Leave command (30 transmissions with 4ms delay between each, plus transmission overhead - approximately 1 second total per ITHO specification)
+- **Pairing support** - Register ESP32 as a remote control using `substitutions.pairing_mode`: `standard` sends Join only (10 transmissions), `compat` sends Join2 only (10 transmissions), and the default `both` sends Join followed by Join2 (20 transmissions total). Leave command behavior is unchanged: 30 transmissions with 4ms delay between each, plus transmission overhead - approximately 1 second total per ITHO specification
 - **Monitor ventilation unit status** via hardwired switch position and actual fan speed
 - **Real-time fan speed monitoring** - Displays current ventilation speed as percentage
 - **Humidity monitoring** - Receives and displays humidity measurements from ventilation unit broadcasts (unit periodically transmits this data)
@@ -109,26 +111,23 @@ To use the ESP32 as a remote control, you must first pair it with your ITHO vent
    - The unit will be in pairing mode for approximately 2 minutes
    - *Note: Exact procedure varies by model - consult your unit's manual*
 
-2. **Immediately press the "Pair Remote" button** in Home Assistant or the web interface
-   - The join packet is transmitted **10 times** with 40ms delay between transmissions for reliable reception
-   - The device ID is automatically generated from the last 3 bytes of the ESP32 MAC address
-   - The ESP32 logs will show `Sending Join command (counter=X)` with the device ID
+1. **Press the "Pair Remote" button** in Home Assistant or the web interface
 
-3. **Watch for confirmation in the ESP32 logs:**
-   - A successful pairing causes the unit to briefly vary the fan speed
-   - If `allowed_units_config` is configured with your unit's device ID, the logs will show
-     `Received fan speed: X.X (Source: Your Unit)` indicating the speed change
-   - If the unit ID is **not yet** in `allowed_units_config`, the logs will show:
-     ```
-     Received packet from unknown ventilation unit: XX.YY.ZZ
-       → To enable monitoring, add "XX.YY.ZZ Your Unit" to allowed_units_config
-     ```
-     Note the `XX.YY.ZZ` value — **this is your unit's device ID**. Add it to
-     `allowed_units_config` in the YAML configuration to enable fan speed monitoring.
+  The behavior depends on `substitutions.pairing_mode`: `both` (default) sends standard Join and then Join2 (compat), `standard` sends standard Join only, and `compat` sends Join2 (compat) only.
 
-4. **Test the pairing:**
-   - Press "Low", "Medium", or "High" buttons
-   - The ventilation speed should change accordingly
+1. **Wait for confirmation:**
+  The unit should shortly vary the fan speed to confirm pairing. Check the ESP32 logs for `Pairing mode: ...` first. In `standard` mode, logs will show `Sending Join command (counter=X)` and the Join packet is transmitted 10 times with 40ms delay. In `compat` mode, logs will show `Sending Join2 (compat) command (counter=X)` and the Join2 packet is transmitted 10 times with 40ms delay. In the default `both` mode, logs will show both Join lines, with Join sent 10 times and Join2 sent 10 times, for 20 pairing transmissions total. The device ID is automatically generated from the last 3 bytes of the ESP32 MAC address.
+
+1. **Test the pairing:**
+  Press "Low", "Medium", or "High" buttons. The ventilation speed should change accordingly. Each command is transmitted exactly 3 times to ensure reliable reception.
+
+**Success indicators:**
+
+- The ventilation unit will briefly change fan speeds (usually a quick ramp up/down) to acknowledge successful pairing
+- After pairing, all speed control commands (Low/Medium/High) should work reliably
+- In `standard` mode, the ESP32 logs will show `Pairing mode: standard` and `Sending Join command (counter=X)`
+- In `compat` mode, the ESP32 logs will show `Pairing mode: compat` and `Sending Join2 (compat) command (counter=X)`
+- In the default `both` mode, the ESP32 logs will show `Pairing mode: both`, then both Join variants in sequence
 
 **Notes:**
 
@@ -137,6 +136,7 @@ To use the ESP32 as a remote control, you must first pair it with your ITHO vent
 - The device ID is derived from the last 3 bytes of the ESP32's MAC address, ensuring uniqueness
 - If pairing fails, verify the unit is in pairing mode and try again within the 2-minute window
 - You can press "Pair Remote" multiple times within the pairing window to improve reliability
+- For ITHO CVE-ECO P-001 V001 specifically, test with the ESP32 physically close to the unit during pairing (first successful pairing is usually the most sensitive to RF conditions)
 
 ## Controlling the Ventilation
 
@@ -229,12 +229,12 @@ Remote control commands are 63 bytes (raw) which decode to approximately 24 byte
 
 **Command byte patterns at decoded bytes 5-10:**
 
-| Command | Byte Pattern              | Notes                          |
-|---------|---------------------------|--------------------------------|
-| Low     | 22 F1 03 00 02 04         | Fixed low speed                |
-| Medium  | 22 F1 03 00 03 04         | Fixed medium speed             |
-| High    | 22 F1 03 00 04 04         | Fixed high speed               |
-| Timer   | 22 F3 03 00 00 0A/14/1E   | Timed boost (10/20/30 minutes) |
+| Command | Byte Pattern            | Notes                          |
+| ------- | ----------------------- | ------------------------------ |
+| Low     | 22 F1 03 00 02 04       | Fixed low speed                |
+| Medium  | 22 F1 03 00 03 04       | Fixed medium speed             |
+| High    | 22 F1 03 00 04 04       | Fixed high speed               |
+| Timer   | 22 F3 03 00 00 0A/14/1E | Timed boost (10/20/30 minutes) |
 
 Example decoded packet (High command):
 
@@ -317,7 +317,7 @@ The implementation uses a queued script architecture to ensure reliable command 
 Transmission parameters:
 
 - **Standard commands** (Low/Medium/High): 3 transmissions with 40ms delay
-- **Join command**: 10 transmissions with 40ms delay
+- **Join commands**: `standard` mode sends Join 10 times with 40ms delay, `compat` mode sends Join2 10 times with 40ms delay, and the default `both` mode sends Join 10 times followed by Join2 10 times with a 600ms gap between the two sequences
 - **Leave command**: 30 transmissions with 4ms delay (approximately 1 second total)
 
 The `transmit_count` parameter specifies exactly how many times to send the packet - not how many repeats after the first transmission.
@@ -369,16 +369,16 @@ The `transmit_count` parameter specifies exactly how many times to send the pack
 
 ### Hardware Connections
 
-| CC1101 Pin    | ESP32 Pin | Description                      |
-|---------------|-----------|----------------------------------|
-| 1 - VCC       | 3V3       | 3.3V power                       |
-| 2 - GND       | GND       | Ground                           |
-| 3 - MOSI      | GPIO23    | Data input to CC1101             |
-| 4 - SCK       | GPIO18    | Clock pin                        |
-| 5 - MISO/GDO1 | GPIO19    | Data output from CC1101          |
-| 6 - GDO2      | GPIO4     | Programmable output (not used)   |
-| 7 - GDO0      | GPIO16    | Packet ready interrupt           |
-| 8 - CSN       | GPIO22    | Chip select (SPI_SS)             |
+| CC1101 Pin    | ESP32 Pin | Description                    |
+| ------------- | --------- | ------------------------------ |
+| 1 - VCC       | 3V3       | 3.3V power                     |
+| 2 - GND       | GND       | Ground                         |
+| 3 - MOSI      | GPIO23    | Data input to CC1101           |
+| 4 - SCK       | GPIO18    | Clock pin                      |
+| 5 - MISO/GDO1 | GPIO19    | Data output from CC1101        |
+| 6 - GDO2      | GPIO4     | Programmable output (not used) |
+| 7 - GDO0      | GPIO16    | Packet ready interrupt         |
+| 8 - CSN       | GPIO22    | Chip select (SPI_SS)           |
 
 ### CC1101 868MHz RF Module
 
@@ -468,4 +468,4 @@ Then restart mosquitto: `sudo systemctl restart mosquitto`
 - **Pairing procedure varies** - Different ITHO models have different pairing methods; consult your unit's manual for specific instructions
 - **Remote ID whitelist** - Must manually add new remote IDs to configuration and recompile firmware (device IDs are logged when unknown devices transmit)
 - **Timer transmission** - The ESP32 can only receive and display timer commands from original ITHO remotes. It cannot yet transmit timer commands (only Low/Medium/High and Join/Leave are supported).
-- **Model compatibility** - Tested with ITHO Daalderop CVE-S ECO; other models may require timing or encoding adjustments
+- **Model compatibility** - Tested with ITHO Daalderop CVE-S ECO. Compatibility pairing has been added for older/variant receivers (including reports around CVE-ECO P-001 V001), but RF behavior can still vary by hardware revision and installation
