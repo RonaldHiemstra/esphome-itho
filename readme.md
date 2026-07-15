@@ -1,6 +1,6 @@
 # ITHO Mechanical Ventilation Control
 
-This project monitors and controls an ITHO mechanical ventilation system using an ESP32 with CC1101 RF transceiver and ESPHome firmware. The system can receive and decode RF commands from ITHO remotes and monitor the ventilation unit's status.
+This project monitors and controls an ITHO mechanical ventilation system using an ESP32 with CC1101 RF transceiver and ESPHome firmware. The system can receive and decode RF commands from ITHO remote controls and monitor the ventilation unit's status.
 
 **Project Status:** ✅ **Fully Functional** - Pairing, command transmission (Standby/Low/Medium/High), and status monitoring are all working reliably.
 
@@ -40,7 +40,7 @@ This configuration is designed to be easily deployed across multiple ESP32 devic
      - **Must use hyphens only** (no underscores) per RFC hostname standards
    - `substitutions.device_prefix` - Unique prefix for entity IDs (e.g., `itho_kitchen`, `itho_bathroom`)
      - **Must use underscores** to match the device_name but with underscores instead of hyphens
-   - `substitutions.pairing_mode` - Pairing mode for the Pair Remote button (`both`, `standard`, or `compat`)
+   - `substitutions.pairing_mode` - Pairing mode for the Pair Remote Control button (`both`, `standard`, or `compat`)
    - `esphome.friendly_name` - Human-readable name
    - GPIO pins if your wiring differs
    - MQTT log topic if desired
@@ -74,7 +74,7 @@ This ensures multiple devices can coexist in Home Assistant without ID conflicts
 
 - **Receive RF commands** from ITHO remote controls (Standby, Low, Medium, High, Timer); model behavior differs, with some units exposing 3 effective levels and others 4
 - **Timer countdown display** - Shows remaining time when timer mode is activated (10/20/30 minutes)
-- **Remote ID whitelist** - Only accept commands from authorized remotes (security feature)
+- **Remote Control ID whitelist** - Only accept commands from authorized remote controls (security feature)
 - **Transmit commands** to control ventilation speed (Standby, Low, Medium, High) - each command is transmitted exactly 3 times with 40ms delay between transmissions
 - **Pairing support** - Register ESP32 as a remote control using `substitutions.pairing_mode`: `standard` sends Join only (10 transmissions), `compat` sends Join2 only (10 transmissions), and the default `both` sends Join followed by Join2 (20 transmissions total). Leave command behavior is unchanged: 30 transmissions with 4ms delay between each, plus transmission overhead - approximately 1 second total per ITHO specification
 - **Monitor ventilation unit status** via hardwired switch position and actual fan speed
@@ -94,11 +94,11 @@ This ensures multiple devices can coexist in Home Assistant without ID conflicts
 This project is tested with the following ITHO equipment:
 
 - **Ventilation Unit:** ITHO Daalderop CVE-S ECO
-- **Original Remote:** ITHO RFT bedieningsschakelaar (RF remote control switch)
+- **Original Remote Control:** ITHO RFT bedieningsschakelaar (RF remote control switch)
 - **ESP32 Module:** ESP32 DevKit (ESP-WROOM-32)
 - **RF Transceiver:** CC1101 868MHz module
 
-The ESP32 with CC1101 acts as an additional remote control, allowing integration with Home Assistant while maintaining compatibility with the original ITHO remote.
+The ESP32 with CC1101 acts as an additional remote control, allowing integration with Home Assistant while maintaining compatibility with the original ITHO remote control.
 
 Model support differs across the ITHO range. Some units effectively expose 3 speed levels, while others support 4 distinct levels. For example, on the CVE-S ECO, `Standby` and `Low` behave the same, while remotes such as the CVE ECO RFT are reported to support a distinct fourth level via command byte `0x01`.
 
@@ -113,7 +113,7 @@ To use the ESP32 as a remote control, you must first pair it with your ITHO vent
    - The unit will be in pairing mode for approximately 2 minutes
    - *Note: Exact procedure varies by model - consult your unit's manual*
 
-1. **Press the "Pair Remote" button** in Home Assistant or the web interface
+1. **Press the "Pair Remote Control" button** in Home Assistant or the web interface
 
   The behavior depends on `substitutions.pairing_mode`: `both` (default) sends standard Join and then Join2 (compat), `standard` sends standard Join only, and `compat` sends Join2 (compat) only.
 
@@ -137,7 +137,7 @@ To use the ESP32 as a remote control, you must first pair it with your ITHO vent
 - The packet counter increments with each command to prevent replay attacks
 - The device ID is derived from the last 3 bytes of the ESP32's MAC address, ensuring uniqueness
 - If pairing fails, verify the unit is in pairing mode and try again within the 2-minute window
-- You can press "Pair Remote" multiple times within the pairing window to improve reliability
+- You can press "Pair Remote Control" multiple times within the pairing window to improve reliability
 - For ITHO CVE-ECO P-001 V001 specifically, test with the ESP32 physically close to the unit during pairing (first successful pairing is usually the most sensitive to RF conditions)
 
 ## Controlling the Ventilation
@@ -167,7 +167,7 @@ When a Timer command is received from an ITHO remote control, the system:
 
 **Note:** Timer mode can only be activated by original ITHO remote controls that support timer functionality. The ESP32 currently transmits Standby/Low/Medium/High commands, but not timer commands.
 
-## Remote ID Whitelist (Security)
+## Remote Control ID Whitelist (Security)
 
 The configuration includes a whitelist of authorized devices. This applies to both:
 
@@ -206,7 +206,7 @@ globals:
 1. Monitor ESP32 logs while the device transmits
 2. Look for warnings like:
    - `Received packet from unknown ventilation unit: XX.YY.ZZ`
-   - `Ignored packet from unknown remote unit: XX.YY.ZZ`
+   - `Ignored packet from unknown remote control: XX.YY.ZZ`
 3. Add the device ID to the appropriate vector in the globals section:
 
    ```yaml
@@ -295,7 +295,7 @@ The complete configuration is in [itho-ventilation.yaml](itho-ventilation.yaml) 
 1. **CC1101 Component** - Configures RF transceiver with ITHO-specific parameters
 2. **Packet Decoder Lambda** - Implements Manchester-like decoding starting from STARTBYTE=5 (after 5-byte ITHO header)
 3. **Manchester Encoder Lambda** - Encodes payload data with ITHO's custom Manchester-like encoding for transmission
-4. **Command Detection** - Pattern matching for remote commands and status messages
+4. **Command Detection** - Pattern matching for remote control commands and status messages
 5. **Queued Transmission System** - Ensures reliable command delivery with configurable repeat count and delay
 6. **MQTT Integration** - Publishes state to Home Assistant via MQTT
 7. **Text Sensors** - Exposes current command, control source, and timer countdown
@@ -341,10 +341,10 @@ The `transmit_count` parameter specifies exactly how many times to send the pack
    → Parse speed from byte[13]
    → Update fan_speed sensor with percentage (0x00-0xC8(=200) mapped to 0-100%)
    → Clear last_command if speed no longer matches
-4. Check if remote command (byte[5]==0x22 && byte[7]==0x03)
-   → Verify device ID against remote whitelist (bytes[1-3])
+4. Check if remote control command (byte[5]==0x22 && byte[7]==0x03)
+   → Verify device ID against remote control whitelist (bytes[1-3])
    → Timer: byte[6]==0xF3, extract duration from byte[10] (0x0A/0x14/0x1E)
-  → Standby/Low/Med/High: byte[6]==0xF1, distinguished by byte[9] (0x01/0x02/0x03/0x04)
+   → Standby/Low/Med/High: byte[6]==0xF1, distinguished by byte[9] (0x01/0x02/0x03/0x04)
    → Update controller_name and last_command sensors
 5. Unknown packets → Logged to unknown_message sensor for debugging
 ```

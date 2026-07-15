@@ -56,18 +56,18 @@ wifi:
 # followed by a space and then the device name/description
 
 globals:
-  # Pairing mode for the Pair Remote button.
+  # Pairing mode for the Pair Remote Control button.
   # standard = send Join only, compat = send Join2 only, both = send Join + Join2.
   - id: pairing_mode_config
     type: std::string
     restore_value: no
     initial_value: '"${pairing_mode}"'
 
-  # ALLOWED REMOTE IDs (Physical remotes and virtual remotes like Home Assistant)
+  # ALLOWED REMOTE IDs (Physical remote controls and virtual remote controls like Home Assistant)
   - id: allowed_remotes_config
     type: std::vector<std::string>
     restore_value: no
-    initial_value: '{"51.36.35 Badkamer", "5F.53.40 Home assistant", "A8.86.D4 ESP test remote"}'
+    initial_value: '{"51.36.35 Badkamer", "5F.53.40 Home assistant", "A8.86.D4 ESP test remote control"}'
 
   # ALLOWED VENTILATION UNIT IDs
   - id: allowed_units_config
@@ -95,7 +95,7 @@ globals:
   - id: device_type
     type: uint8_t
     restore_value: no
-    initial_value: '22'  # 0x16 = 22 decimal, standard ITHO remote type
+    initial_value: '22'  # 0x16 = 22 decimal, standard ITHO remote control type
   - id: packet_counter
     type: uint8_t
     restore_value: yes
@@ -269,7 +269,7 @@ cc1101:
                      source_name.c_str(), decoded[0], decoded[12]);
             return;
           }
-          // Remote command packets: check bytes 5-10 against command patterns
+          // Remote control command packets: check bytes 5-10 against command patterns
           // Based on IthoCC1101::checkIthoCommand() and command byte arrays
           // Standby:0x22, 0xF1, 0x03, 0x00, 0x01, 0x04
           // Low:    0x22, 0xF1, 0x03, 0x00, 0x02, 0x04
@@ -277,7 +277,7 @@ cc1101:
           // High:   0x22, 0xF1, 0x03, 0x00, 0x04, 0x04
           // Timer:  0x22, 0xF3, 0x03, 0x00, 0x00, 0x0A/14/1E
           else if (decoded_len >= 11 && decoded[5] == 0x22 && decoded[7] == 0x03) {
-            // Parse allowed remote IDs from config vector (format: "XX.YY.ZZ Name")
+            // Parse allowed remote control IDs from config vector (format: "XX.YY.ZZ Name")
             std::string source_name = "";
             std::string device_id = format_hex_pretty(&decoded[1], 3);
             
@@ -290,7 +290,7 @@ cc1101:
             }
 
             if (source_name.empty()) {
-              ESP_LOGW("itho", "Ignored packet from unknown remote unit: %s", device_id.c_str());
+              ESP_LOGW("itho", "Ignored packet from unknown remote control: %s", device_id.c_str());
               return;  // Reject commands from unknown devices
             }
 
@@ -318,7 +318,7 @@ cc1101:
               }
             }
 
-            // Update sensors for remote commands
+            // Update sensors for remote control commands
             if (command != nullptr) {
               ESP_LOGI("itho", "Command: %s (Source: %s)", command, source_name.c_str());
               id(controller_name).publish_state(source_name);
@@ -382,14 +382,14 @@ text_sensor:
 # Buttons for pairing and control
 button:
   - platform: template
-    name: "${device_prefix} Pair Remote"
+    name: "${device_prefix} Pair Remote Control"
     icon: "mdi:link-plus"
     on_press:
       - script.execute:
           id: send_pair_sequence
 
   - platform: template
-    name: "${device_prefix} Leave Remote"
+    name: "${device_prefix} Leave Remote Control"
     icon: "mdi:link-off"
     on_press:
       - script.execute:
@@ -433,7 +433,7 @@ button:
 # Scripts
 script:
   # Compatibility pairing sequence for older/variant ITHO receivers.
-  # Sends standard Join and then alternative Join2 used by some remotes.
+  # Sends standard Join and then alternative Join2 used by some ventilation units.
   - id: send_pair_sequence
     mode: single
     then:
