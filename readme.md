@@ -2,7 +2,7 @@
 
 This project monitors and controls an ITHO mechanical ventilation system using an ESP32 with CC1101 RF transceiver and ESPHome firmware. The system can receive and decode RF commands from ITHO remotes and monitor the ventilation unit's status.
 
-**Project Status:** ✅ **Fully Functional** - Pairing, command transmission (Low/Medium/High), and status monitoring are all working reliably.
+**Project Status:** ✅ **Fully Functional** - Pairing, command transmission (Standby/Low/Medium/High), and status monitoring are all working reliably.
 
 **Based on:**
 
@@ -72,10 +72,10 @@ This ensures multiple devices can coexist in Home Assistant without ID conflicts
 
 ### ✅ Fully Working
 
-- **Receive RF commands** from ITHO remote controls (Low, Medium, High, Timer)
+- **Receive RF commands** from ITHO remote controls (Standby, Low, Medium, High, Timer); model behavior differs, with some units exposing 3 effective levels and others 4
 - **Timer countdown display** - Shows remaining time when timer mode is activated (10/20/30 minutes)
 - **Remote ID whitelist** - Only accept commands from authorized remotes (security feature)
-- **Transmit commands** to control ventilation speed (Low, Medium, High) - each command is transmitted exactly 3 times with 40ms delay between transmissions
+- **Transmit commands** to control ventilation speed (Standby, Low, Medium, High) - each command is transmitted exactly 3 times with 40ms delay between transmissions
 - **Pairing support** - Register ESP32 as a remote control using `substitutions.pairing_mode`: `standard` sends Join only (10 transmissions), `compat` sends Join2 only (10 transmissions), and the default `both` sends Join followed by Join2 (20 transmissions total). Leave command behavior is unchanged: 30 transmissions with 4ms delay between each, plus transmission overhead - approximately 1 second total per ITHO specification
 - **Monitor ventilation unit status** via hardwired switch position and actual fan speed
 - **Real-time fan speed monitoring** - Displays current ventilation speed as percentage
@@ -100,6 +100,8 @@ This project is tested with the following ITHO equipment:
 
 The ESP32 with CC1101 acts as an additional remote control, allowing integration with Home Assistant while maintaining compatibility with the original ITHO remote.
 
+Model support differs across the ITHO range. Some units effectively expose 3 speed levels, while others support 4 distinct levels. For example, on the CVE-S ECO, `Standby` and `Low` behave the same, while remotes such as the CVE ECO RFT are reported to support a distinct fourth level via command byte `0x01`.
+
 ## Pairing Process
 
 To use the ESP32 as a remote control, you must first pair it with your ITHO ventilation unit:
@@ -119,12 +121,12 @@ To use the ESP32 as a remote control, you must first pair it with your ITHO vent
   The unit should shortly vary the fan speed to confirm pairing. Check the ESP32 logs for `Pairing mode: ...` first. In `standard` mode, logs will show `Sending Join command (counter=X)` and the Join packet is transmitted 10 times with 40ms delay. In `compat` mode, logs will show `Sending Join2 (compat) command (counter=X)` and the Join2 packet is transmitted 10 times with 40ms delay. In the default `both` mode, logs will show both Join lines, with Join sent 10 times and Join2 sent 10 times, for 20 pairing transmissions total. The device ID is automatically generated from the last 3 bytes of the ESP32 MAC address.
 
 1. **Test the pairing:**
-  Press "Low", "Medium", or "High" buttons. The ventilation speed should change accordingly. Each command is transmitted exactly 3 times to ensure reliable reception.
+  Press "Standby", "Low", "Medium", or "High" buttons. The ventilation speed should change accordingly. Each command is transmitted exactly 3 times to ensure reliable reception.
 
 **Success indicators:**
 
 - The ventilation unit will briefly change fan speeds (usually a quick ramp up/down) to acknowledge successful pairing
-- After pairing, all speed control commands (Low/Medium/High) should work reliably
+- After pairing, all speed control commands (Standby/Low/Medium/High) should work reliably
 - In `standard` mode, the ESP32 logs will show `Pairing mode: standard` and `Sending Join command (counter=X)`
 - In `compat` mode, the ESP32 logs will show `Pairing mode: compat` and `Sending Join2 (compat) command (counter=X)`
 - In the default `both` mode, the ESP32 logs will show `Pairing mode: both`, then both Join variants in sequence
@@ -142,6 +144,7 @@ To use the ESP32 as a remote control, you must first pair it with your ITHO vent
 
 Once paired, use these buttons to control your ventilation:
 
+- **Standby** - Set fan to minimal speed (near-off airflow). On CVE-S ECO this behaves the same as Low.
 - **Low** - Set fan to low speed
 - **Medium** - Set fan to medium speed  
 - **High** - Set fan to high speed
@@ -160,9 +163,9 @@ When a Timer command is received from an ITHO remote control, the system:
 2. Starts a countdown timer displayed in the "Timer" text sensor
 3. Shows remaining time in MM:SS format (e.g., "10:00", "5:30")
 4. Automatically stops and displays "Off" when the timer expires
-5. Timer is cancelled if a manual Low/Medium/High command is received
+5. Timer is cancelled if a manual Standby/Low/Medium/High command is received
 
-**Note:** Timer mode can only be activated by original ITHO remote controls that support timer functionality. The ESP32 currently only transmits Low/Medium/High commands.
+**Note:** Timer mode can only be activated by original ITHO remote controls that support timer functionality. The ESP32 currently transmits Standby/Low/Medium/High commands, but not timer commands.
 
 ## Remote ID Whitelist (Security)
 
@@ -231,10 +234,13 @@ Remote control commands are 63 bytes (raw) which decode to approximately 24 byte
 
 | Command | Byte Pattern            | Notes                          |
 | ------- | ----------------------- | ------------------------------ |
+| Standby | 22 F1 03 00 01 04       | Minimal speed (near-off)       |
 | Low     | 22 F1 03 00 02 04       | Fixed low speed                |
 | Medium  | 22 F1 03 00 03 04       | Fixed medium speed             |
 | High    | 22 F1 03 00 04 04       | Fixed high speed               |
 | Timer   | 22 F3 03 00 00 0A/14/1E | Timed boost (10/20/30 minutes) |
+
+On CVE-S ECO, the `Standby` command behaves the same as `Low`. Some other models or remote combinations, including reports around CVE ECO RFT, support `Standby` as a distinct fourth level.
 
 Example decoded packet (High command):
 
@@ -316,7 +322,7 @@ The implementation uses a queued script architecture to ensure reliable command 
 
 Transmission parameters:
 
-- **Standard commands** (Low/Medium/High): 3 transmissions with 40ms delay
+- **Standard commands** (Standby/Low/Medium/High): 3 transmissions with 40ms delay
 - **Join commands**: `standard` mode sends Join 10 times with 40ms delay, `compat` mode sends Join2 10 times with 40ms delay, and the default `both` mode sends Join 10 times followed by Join2 10 times with a 600ms gap between the two sequences
 - **Leave command**: 30 transmissions with 4ms delay (approximately 1 second total)
 
@@ -338,7 +344,7 @@ The `transmit_count` parameter specifies exactly how many times to send the pack
 4. Check if remote command (byte[5]==0x22 && byte[7]==0x03)
    → Verify device ID against remote whitelist (bytes[1-3])
    → Timer: byte[6]==0xF3, extract duration from byte[10] (0x0A/0x14/0x1E)
-   → Low/Med/High: byte[6]==0xF1, distinguished by byte[9] (0x02/0x03/0x04)
+  → Standby/Low/Med/High: byte[6]==0xF1, distinguished by byte[9] (0x01/0x02/0x03/0x04)
    → Update controller_name and last_command sensors
 5. Unknown packets → Logged to unknown_message sensor for debugging
 ```
@@ -353,7 +359,7 @@ The `transmit_count` parameter specifies exactly how many times to send the pack
   - `uptime` - Device uptime in seconds
   - `wifi_signal` - WiFi signal strength
 - Text Sensors:
-  - `last_command` - Last received command (Low/Medium/High/Timer)
+  - `last_command` - Last received command (Standby/Low/Medium/High/Timer)
   - `controller_name` - Source of last command (e.g., "Badkamer" or "Ventilatie unit")
   - `timer` - Timer countdown display (MM:SS format, or "Off" when inactive)
   - `unknown_message` - Debug sensor showing unrecognized ITHO packets
@@ -467,5 +473,5 @@ Then restart mosquitto: `sudo systemctl restart mosquitto`
 - **RF noise** - The receiver may pick up interference from nearby RF sources. Hardware filtering or antenna placement may help. Non-ITHO packets with RSSI < -90 dBm are silently ignored.
 - **Pairing procedure varies** - Different ITHO models have different pairing methods; consult your unit's manual for specific instructions
 - **Remote ID whitelist** - Must manually add new remote IDs to configuration and recompile firmware (device IDs are logged when unknown devices transmit)
-- **Timer transmission** - The ESP32 can only receive and display timer commands from original ITHO remotes. It cannot yet transmit timer commands (only Low/Medium/High and Join/Leave are supported).
-- **Model compatibility** - Tested with ITHO Daalderop CVE-S ECO. Compatibility pairing has been added for older/variant receivers (including reports around CVE-ECO P-001 V001), but RF behavior can still vary by hardware revision and installation
+- **Timer transmission** - The ESP32 can only receive and display timer commands from original ITHO remotes. It cannot yet transmit timer commands (only Standby/Low/Medium/High and Join/Leave are supported).
+- **Model compatibility** - Tested with ITHO Daalderop CVE-S ECO. Compatibility pairing has been added for older/variant receivers (including reports around CVE-ECO P-001 V001), but RF behavior can still vary by hardware revision and installation. In particular, some models effectively expose 3 speed levels, while others support 4 distinct levels; on CVE-S ECO, Standby and Low behave the same, while some CVE ECO RFT combinations report a distinct Standby level.
